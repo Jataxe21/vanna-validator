@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
 """
-Phase 1B: Vanna Proxy + Movement/Gamma Pressure Validator
+0DTE SPX Short Iron Butterfly — Loss Attribution & Tradable Filter Analysis
 
 Uses the data currently available in this repo:
-- completed 0DTE SPX iron butterfly trades
-- daily SPX OHLCV history
+- completed 0DTE SPX iron butterfly trades (data/trades.csv)
+- daily SPX OHLCV history (data/spx_daily.csv)
+- optional intraday SPX bars (data/spx_intraday.csv) — enables first-breach simulation
 
-This is NOT true strike-level vanna/GEX modeling because the repo does not
-contain historical option-chain Greeks, IV, OI, volume, or bid/ask data.
-It is a proxy regime analysis plus a movement/gamma-pressure diagnostic:
-- do losses cluster on high range / high volatility / high underlying-move days?
-- do losses cluster when SPX moves too far during the trade?
-- what movement threshold is the best practical kill-switch candidate?
+ESTABLISHED FINDING:
+  Losses are NOT explained by a "proxy-vanna"/volatility regime.
+  They ARE explained by adverse underlying MOVEMENT and DISTANCE of price from
+  the body strike AT EXIT.
+
+BIAS WARNING:
+  Exit-derived metrics (underlying_move_abs_pts, abs_exit_distance_from_center)
+  are OUTCOMES, not entry inputs. Any "skip threshold" derived from them is
+  POST-HOC and subject to look-ahead bias — it re-describes the losers after
+  the fact and is NOT a tradable edge.
+
+  Tradable counterfactuals (entry time filters, intraday first-breach stop) are
+  clearly separated in ENTRY_FILTER_REPORT.txt and INTRADAY_STOP_SIMULATION.txt.
 """
 
 from pathlib import Path
@@ -180,11 +188,19 @@ class VannaProxyValidator:
         }
 
     def analyze_movement_thresholds(self):
-        """Test practical movement/gamma-pressure thresholds using completed trade data.
+        """Post-hoc diagnostic: how do losses cluster by exit-measured movement?
 
-        This is not a perfect intraday stop simulation because we only know entry and exit
-        underlying prices, not the full path. It is still useful for identifying whether
-        losses are concentrated in trades that ultimately experienced large movement.
+        POST-HOC / LOOK-AHEAD BIAS WARNING
+        -----------------------------------
+        underlying_move_abs_pts = abs(underlyingClose - underlyingOpen) — this is measured at
+        the ACTUAL EXIT. It is an outcome, not an entry- or mid-trade-decision input.
+        Flagging trades by "underlying_move >= threshold" is a RE-DESCRIPTION of the losers,
+        not predictive skill. The "post_hoc_separation_score" and
+        "pnl_impact_if_skipped_POST_HOC_BIASED" columns therefore CANNOT be acted on at entry.
+        They are retained here as a diagnostic to show WHERE losses cluster, nothing more.
+
+        For genuinely tradable counterfactuals, see ENTRY_FILTER_REPORT.txt and
+        INTRADAY_STOP_SIMULATION.txt.
         """
         trades = self.trades.copy()
         total_losses = int((trades["outcome"] == "LOSS").sum())
@@ -213,17 +229,19 @@ class VannaProxyValidator:
                 "flagged_total_pnl": float(flagged["pnl"].sum()),
                 "kept_total_pnl": float(kept["pnl"].sum()),
                 "kept_win_rate": kept_wins / len(kept) if len(kept) else np.nan,
-                "pnl_removed_if_skipped": float(flagged["pnl"].sum()),
-                "pnl_delta_if_skipped": float(kept["pnl"].sum() - baseline_pnl),
+                "pnl_removed_if_flagged_bucket": float(flagged["pnl"].sum()),
+                # BIASED: uses exit-measured movement — cannot be acted on at entry
+                "pnl_impact_if_skipped_POST_HOC_BIASED": float(kept["pnl"].sum() - baseline_pnl),
                 "losses_avoided_per_winner_sacrificed": flagged_losses / flagged_wins if flagged_wins else np.inf,
             })
 
         df = pd.DataFrame(rows)
-        # Candidate score: capture losses, minimize sacrificed winners, avoid killing too much sample.
-        df["kill_switch_score"] = (
+        # Post-hoc separation quality score — diagnostic only, biased (uses exit outcomes).
+        # Renamed from "kill_switch_score" to prevent misuse as a strategy signal.
+        df["post_hoc_separation_score (diagnostic only, biased)"] = (
             2.0 * df["loss_capture_rate"].fillna(0)
             - 1.0 * df["winner_penalty_rate"].fillna(0)
-            + 0.0001 * (-df["pnl_removed_if_skipped"].fillna(0))
+            + 0.0001 * (-df["pnl_removed_if_flagged_bucket"].fillna(0))
         )
         self.movement_thresholds = df
 
@@ -332,31 +350,47 @@ NEXT STEPS
         wins = trades[trades["outcome"] == "WIN"]
         thresholds = self.movement_thresholds.copy()
 
-        # Avoid recommending thresholds that flag almost the entire book or almost nothing.
+        # Pick the threshold with best post-hoc separation, but only to illustrate the
+        # diagnostic — NOT as a recommended entry rule.
+        score_col = "post_hoc_separation_score (diagnostic only, biased)"
         candidate_pool = thresholds[(thresholds["flagged_trades"] >= 3) & (thresholds["kept_trades"] >= 10)].copy()
         if candidate_pool.empty:
             candidate_pool = thresholds.copy()
-        best = candidate_pool.sort_values("kill_switch_score", ascending=False).iloc[0]
+        best = candidate_pool.sort_values(score_col, ascending=False).iloc[0]
 
         loss_move_q = losses["underlying_move_abs_pts"].describe(percentiles=[0.25, 0.5, 0.75]).to_string()
         win_move_q = wins["underlying_move_abs_pts"].describe(percentiles=[0.25, 0.5, 0.75]).to_string()
 
         report = f"""
-MOVEMENT / GAMMA PRESSURE VALIDATOR REPORT
-==========================================
+MOVEMENT / GAMMA PRESSURE DIAGNOSTIC REPORT
+============================================
 
-WHAT THIS TESTS
----------------
-This tests the failure mode that showed up in the first proxy analysis:
-losses appear more related to SPX moving too far during the position than to
-high proxy-vanna / high daily volatility regimes.
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  POST-HOC DIAGNOSTIC — NOT A TRADABLE STRATEGY                             ║
+║                                                                              ║
+║  ALL movement / exit-distance metrics in this report are computed from      ║
+║  EXIT data (underlyingClose at trade exit). They are OUTCOMES, not inputs   ║
+║  you can observe at entry or mid-trade. Thresholds derived from exit        ║
+║  movement RE-DESCRIBE the losers after the fact; they do not predict them.  ║
+║                                                                              ║
+║  For TRADABLE counterfactuals, see:                                          ║
+║    • outputs/ENTRY_FILTER_REPORT.txt  (entry-time & prior-day range filters)║
+║    • outputs/INTRADAY_STOP_SIMULATION.txt  (first-breach stop, if intraday  ║
+║      data is present)                                                        ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+WHAT THIS DIAGNOSTIC TESTS
+---------------------------
+It answers: "After the fact, on trades that lost — how large was the underlying
+move and how far was price from the body strike at exit?" This is useful for
+understanding the MECHANISM of losses, not for predicting or filtering them.
 
 DATA LIMITATION
 ---------------
-This is not a perfect intraday stop-loss backtest because the dataset only has
-entry and exit underlying prices, not second-by-second or minute-by-minute SPX
-path data. Treat the threshold table as a diagnostic for where losses cluster,
-not as a fully executable stop order simulation.
+This uses entry and exit underlying prices only, NOT second-by-second or
+minute-by-minute SPX path data. Every metric below (underlying_move_abs_pts,
+abs_exit_distance_from_center) is measured AT THE ACTUAL EXIT and is therefore
+unknowable at entry. Do NOT attempt to use these numbers as live rules.
 
 BASELINE
 --------
@@ -366,26 +400,32 @@ Losses: {len(losses)}
 Total P/L: ${trades['pnl'].sum():,.0f}
 Baseline win rate: {(trades['outcome'].eq('WIN').mean()):.1%}
 
-CORE FINDINGS
--------------
-Correlation: P/L vs absolute SPX move during trade: {self.summary['corr_pnl_abs_underlying_move']:.3f}
-Correlation: P/L vs absolute exit distance from center strike: {self.summary['corr_pnl_abs_exit_distance']:.3f}
+CORE FINDINGS (DIAGNOSTIC ONLY)
+---------------------------------
+Correlation: P/L vs absolute SPX move during trade (EXIT metric): {self.summary['corr_pnl_abs_underlying_move']:.3f}
+Correlation: P/L vs absolute exit distance from center strike (EXIT metric): {self.summary['corr_pnl_abs_exit_distance']:.3f}
 
-Loss movement distribution:
+Loss movement distribution (EXIT-MEASURED — post-hoc):
 {loss_move_q}
 
-Win movement distribution:
+Win movement distribution (EXIT-MEASURED — post-hoc):
 {win_move_q}
 
-BEST DIAGNOSTIC THRESHOLD CANDIDATE
------------------------------------
-Threshold: {best['threshold_pts']} SPX points
+BEST POST-HOC SEPARATION THRESHOLD (DIAGNOSTIC ONLY — BIASED, NOT TRADABLE)
+-----------------------------------------------------------------------------
+⚠ WARNING: The number below is derived from EXIT-measured movement. Because a
+  large loss BY DEFINITION has a large exit move, "flag trades that moved >=X pts"
+  is a circular re-description of the losers. It is NOT a forward-looking signal
+  you can act on at trade entry. The P/L delta shown is similarly BIASED.
+
+Threshold: {best['threshold_pts']} SPX points (exit-measured, post-hoc)
 Flagged trades: {int(best['flagged_trades'])}
 Flagged losses: {int(best['flagged_losses'])} of {len(losses)} ({best['loss_capture_rate']:.1%})
 Flagged winners: {int(best['flagged_wins'])} of {len(wins)} ({best['winner_penalty_rate']:.1%})
 P/L of flagged trades: ${best['flagged_total_pnl']:,.0f}
-If skipped entirely, kept P/L would be: ${best['kept_total_pnl']:,.0f}
-P/L delta if skipped entirely: ${best['pnl_delta_if_skipped']:,.0f}
+If flagged trades had been skipped, kept P/L would be: ${best['kept_total_pnl']:,.0f}
+P/L impact if skipped (POST-HOC BIASED — uses exit-measured movement,
+  cannot be acted on at entry): ${best['pnl_impact_if_skipped_POST_HOC_BIASED']:,.0f}
 
 IMPORTANT INTERPRETATION
 ------------------------
@@ -397,27 +437,35 @@ continues. With minute-level data, the correct implementation may be:
 - exit only if move is away from center plus trade price deteriorates,
 - avoid entries when price is already unstable.
 
-THRESHOLD TABLE
----------------
+POST-HOC THRESHOLD TABLE (EXIT DATA — DIAGNOSTIC ONLY, BIASED)
+---------------------------------------------------------------
+NOTE: "pnl_impact_if_skipped_POST_HOC_BIASED" uses exit-measured movement and
+cannot be acted on at entry. It is labeled BIASED to prevent misuse.
 """
         display_cols = [
             "threshold_pts", "flagged_trades", "flagged_wins", "flagged_losses",
             "loss_capture_rate", "winner_penalty_rate", "flagged_total_pnl",
-            "kept_total_pnl", "pnl_delta_if_skipped", "kill_switch_score",
+            "kept_total_pnl", "pnl_impact_if_skipped_POST_HOC_BIASED",
+            "post_hoc_separation_score (diagnostic only, biased)",
         ]
         report += thresholds[display_cols].to_string(index=False)
-        report += "\n\nCENTER STRIKE DISTANCE SUMMARY\n------------------------------\n"
+        report += "\n\nCENTER STRIKE EXIT-DISTANCE SUMMARY (POST-HOC — EXIT DATA)\n"
+        report += "------------------------------------------------------------\n"
+        report += "abs_exit_distance_from_center is measured at exit — NOT known at entry.\n\n"
         report += self.center_distance_summary.to_string(index=False)
         report += dedent("""
 
 PRACTICAL NEXT STEP
 -------------------
-Do not immediately automate a hard stop from this alone. The smart next step is
-adding intraday SPX path data around each trade, then testing whether a movement
-threshold would have triggered before final exit and at what option price.
+Do not automate a hard stop from this report alone. Every input here is
+post-hoc exit data; using it as a live signal would produce look-ahead bias.
 
-Until then, this report should be used to identify candidate risk guards and
-entry-quality checks, not as final production logic.
+The genuinely actionable next steps are:
+1. See ENTRY_FILTER_REPORT.txt for time-of-day and prior-day range filters
+   that ARE knowable at entry.
+2. See INTRADAY_STOP_SIMULATION.txt for a first-breach stop simulation using
+   intraday SPX path data — the tradable counterfactual.
+3. Collect 50+ more trades before drawing firm conclusions (39-trade sample).
 """)
         (OUTPUT_DIR / "MOVEMENT_PRESSURE_REPORT.txt").write_text(report)
 
@@ -528,6 +576,21 @@ entry-quality checks, not as final production logic.
         self.analyze_movement_thresholds()
         self.write_outputs()
         print(f"Analysis complete. Outputs written to {OUTPUT_DIR}")
+
+        # Ensure the analysis/ directory is on sys.path so sibling modules can
+        # be imported whether this script is run directly or as a module.
+        import sys as _sys
+        _analysis_dir = str(Path(__file__).parent)
+        if _analysis_dir not in _sys.path:
+            _sys.path.insert(0, _analysis_dir)
+
+        # --- Tradable entry filters (entry-time-safe, zero look-ahead) ---
+        from entry_filters import run_entry_filter_analysis
+        run_entry_filter_analysis(self.trades, self.spx, OUTPUT_DIR)
+
+        # --- Intraday first-breach stop simulation (only if data file is present) ---
+        from intraday_sim import run_intraday_stop_simulation
+        run_intraday_stop_simulation(self.trades, DATA_DIR / "spx_intraday.csv", OUTPUT_DIR)
 
 
 if __name__ == "__main__":
