@@ -577,22 +577,19 @@ The genuinely actionable next steps are:
         self.write_outputs()
         print(f"Analysis complete. Outputs written to {OUTPUT_DIR}")
 
+        # Ensure the analysis/ directory is on sys.path so sibling modules can
+        # be imported whether this script is run directly or as a module.
+        import sys as _sys
+        _analysis_dir = str(Path(__file__).parent)
+        if _analysis_dir not in _sys.path:
+            _sys.path.insert(0, _analysis_dir)
+
         # --- Tradable entry filters (entry-time-safe, zero look-ahead) ---
-        try:
-            from entry_filters import run_entry_filter_analysis
-        except ImportError:
-            import sys
-            sys.path.insert(0, str(Path(__file__).parent))
-            from entry_filters import run_entry_filter_analysis
+        from entry_filters import run_entry_filter_analysis
         run_entry_filter_analysis(self.trades, self.spx, OUTPUT_DIR)
 
         # --- Intraday first-breach stop simulation (only if data file is present) ---
-        try:
-            from intraday_sim import run_intraday_stop_simulation
-        except ImportError:
-            import sys
-            sys.path.insert(0, str(Path(__file__).parent))
-            from intraday_sim import run_intraday_stop_simulation
+        from intraday_sim import run_intraday_stop_simulation
         run_intraday_stop_simulation(self.trades, DATA_DIR / "spx_intraday.csv", OUTPUT_DIR)
 
 

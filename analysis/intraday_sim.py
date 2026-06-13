@@ -198,7 +198,16 @@ def run_intraday_stop_simulation(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if not Path(intraday_file).exists():
-        _write_stub_report(output_dir)
+        # Compute actual date range from trades for the stub report.
+        try:
+            open_dates = pd.to_datetime(trades["openDate"])
+            date_range = (
+                f"{open_dates.min().strftime('%Y-%m-%d')} to "
+                f"{open_dates.max().strftime('%Y-%m-%d')}"
+            )
+        except Exception:
+            date_range = ""
+        _write_stub_report(output_dir, date_range=date_range)
         print(
             f"[intraday_sim] data/spx_intraday.csv not found — "
             "first-breach stop simulation skipped. "
@@ -279,7 +288,7 @@ def run_intraday_stop_simulation(
 # Report writers
 # ---------------------------------------------------------------------------
 
-def _write_stub_report(output_dir: Path, error: str = "") -> None:
+def _write_stub_report(output_dir: Path, error: str = "", date_range: str = "") -> None:
     report = """
 INTRADAY FIRST-BREACH STOP SIMULATION
 ======================================
@@ -293,7 +302,7 @@ All other analyses ran normally.
 HOW TO ENABLE THIS SIMULATION
 ------------------------------
 1. Obtain 1-minute SPX (or ES futures) OHLC data covering the date range of
-   your trades (approximately {earliest} to {latest}).
+   your trades{date_range_note}.
    Sources: Tradovate, Interactive Brokers, Alpaca, Polygon.io, etc.
 
 2. Format the data as a CSV with the following columns (no extra columns
@@ -320,8 +329,7 @@ result of running it is the correct number to use for evaluating whether a hard
 stop adds value.
 """.format(
         schema=INTRADAY_SCHEMA,
-        earliest="(trades start date — see data/trades.csv)",
-        latest="(trades end date — see data/trades.csv)",
+        date_range_note=f" ({date_range})" if date_range else " (see data/trades.csv for date range)",
     )
 
     if error:

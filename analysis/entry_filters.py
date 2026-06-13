@@ -34,12 +34,21 @@ import numpy as np
 import pandas as pd
 
 
+# Default time-of-day cutoffs (decimal ET hours: 11.0 = 11:00, 11.5 = 11:30, etc.)
+TIME_CUTOFFS_ET = [11.0, 11.5, 12.0]
+
+
 # ---------------------------------------------------------------------------
 # Helper: entry time parsing
 # ---------------------------------------------------------------------------
 
 def _entry_hour_minute(open_date_series: pd.Series) -> pd.Series:
-    """Return decimal hours (ET assumed) from the openDate timestamp column."""
+    """Return decimal hours from the openDate timestamp column.
+
+    Times are assumed to be ET (Eastern Time), consistent with the 09:30–16:00
+    SPX trading session. If the timestamps carry timezone info (tz-aware), they
+    are used as-is; naive timestamps are treated as ET without conversion.
+    """
     ts = pd.to_datetime(open_date_series)
     return ts.dt.hour + ts.dt.minute / 60.0
 
@@ -275,8 +284,7 @@ def run_entry_filter_analysis(
         spx_work["trade_date"] = pd.to_datetime(spx_work["Date"]).dt.date
 
     # ---- 1. Time-of-day filter ----
-    cutoffs_et = [11.0, 11.5, 12.0]   # 11:00, 11:30, 12:00 ET
-    tod_df = _time_of_day_counterfactuals(trades_work, cutoffs_et)
+    tod_df = _time_of_day_counterfactuals(trades_work, TIME_CUTOFFS_ET)
 
     # ---- 2. Entry-time-safe range / gap filter ----
     range_df, enriched_trades = _range_filter_counterfactuals(trades_work, spx_work)
