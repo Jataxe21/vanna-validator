@@ -1,0 +1,65 @@
+
+VANNA PROXY VALIDATOR REPORT
+============================
+
+DATA LIMITATION
+---------------
+This uses completed trades plus daily SPX OHLCV only. It is not true strike-level
+vanna/GEX because historical option-chain Greeks, IV, OI, volume, and bid/ask are
+not present. Read 'proxy vanna' as a volatility/range/stress-regime proxy.
+
+SAMPLE
+------
+Total trades: 39
+Wins: 30
+Losses: 9
+Baseline win rate: 76.9%
+Baseline total P/L: $10,850
+Proxy-regime classified trades: 36
+Proxy-regime unclassified trades: 3  (usually caused by missing SPX daily row)
+
+KEY QUESTION
+------------
+Do 5+ losses cluster in HIGH proxy-vanna / high volatility regimes?
+Answer: NO - not enough loss clustering in high proxy-vanna regimes
+High proxy-vanna losses: 0 of 9 (0.0%)
+
+WIN VS LOSS COMPARISON
+----------------------
+Average proxy-vanna score on wins: 43.1
+Average proxy-vanna score on losses: 33.2
+Welch t-test p-value: 0.0829
+Mann-Whitney p-value: 0.0887
+
+CORRELATIONS
+------------
+P/L vs proxy-vanna score: 0.169
+P/L vs absolute underlying move: -0.546
+P/L vs absolute exit distance from center strike: -0.747
+
+COUNTERFACTUAL: SKIP HIGH PROXY-VANNA DAYS
+------------------------------------------
+Trades retained: 33 of 39
+Win rate if skipped: 72.7%
+Total P/L if skipped: $7,940
+P/L delta vs baseline: $-2,910
+
+LOSS ATTRIBUTION PROXY
+----------------------
+Directional move / gamma pressure: 8
+Unclassified / execution / noise: 1
+
+ENVIRONMENT SUMMARY
+-------------------
+proxy_vanna_env  trades  wins  losses  total_pnl    avg_pnl  avg_abs_move_pts  avg_range_pct  win_rate
+            LOW      18    12       6       3800 211.111111         10.348333       0.006845  0.666667
+         MEDIUM      12     9       3       1550 129.166667          8.619167       0.007529  0.750000
+           HIGH       6     6       0       2910 485.000000          6.830000       0.011001  1.000000
+
+NEXT STEPS
+----------
+1. Treat this as a screening test, not proof.
+2. If high proxy-vanna days explain many losses, paper-test a no-trade filter.
+3. If movement/gamma pressure is stronger, use MOVEMENT_PRESSURE_REPORT.txt first.
+4. For true vanna/GEX, collect historical SPX chains with IV, delta, gamma, vega, OI, and volume.
+5. Keep sample-size discipline: 39 trades is useful for triage, not final proof.

@@ -1,0 +1,209 @@
+
+ENTRY FILTER REPORT — TRADABLE COUNTERFACTUALS ONLY
+=====================================================
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  TRADABLE COUNTERFACTUALS — ZERO LOOK-AHEAD BIAS                           ║
+║                                                                              ║
+║  Every filter in this report uses ONLY information available at or before   ║
+║  trade entry. No exit price, intraday price, or day's High/Low/Close is     ║
+║  used. These counterfactuals CAN be tested as live entry rules.             ║
+║                                                                              ║
+║  CONTRAST with MOVEMENT_PRESSURE_REPORT.txt which uses exit data and is     ║
+║  explicitly labeled POST-HOC / BIASED.                                       ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+⚠ SAMPLE SIZE CAUTION: 39 trades (9 losses, 30 wins) is a small sample.
+  Results below are triage / hypothesis generation — NOT statistical proof.
+  Validate any promising filter on the next 50+ forward trades before acting.
+
+BASELINE (ALL 39 TRADES)
+------------------------
+Total trades : 39
+Wins         : 30
+Losses       : 9
+Win rate     : 76.9%
+Total P/L    : $10,850
+
+════════════════════════════════════════════════════════════════════════════════
+SECTION 1: TIME-OF-DAY FILTER (TRADABLE — entry time known at entry)
+════════════════════════════════════════════════════════════════════════════════
+
+WHY THIS IS TRADABLE:
+  You know what time it is before you submit an entry order. This filter asks:
+  "What if we only entered trades after a given time cutoff?" It requires no
+  future information whatsoever.
+
+METHODOLOGY:
+  For each cutoff (11:00, 11:30, 12:00 ET), trades entered before the cutoff
+  are treated as "would have been skipped." Wins and losses removed by each
+  cutoff are explicitly reported so you can see the full cost/benefit.
+
+  All times are assumed ET (trades run 09:30–16:00 ET).
+
+  Cutoff: 11:00 ET
+    Trades entered BEFORE cutoff (skipped)  : 5 (3 wins, 2 losses, P/L $-210)
+    Trades entered AT/AFTER cutoff (kept)   : 34 (27 wins, 7 losses)
+    Win rate (kept)                         : 79.4%
+    P/L (kept)                              : $11,060
+    P/L delta vs baseline                   : +$210
+
+  Cutoff: 11:30 ET
+    Trades entered BEFORE cutoff (skipped)  : 17 (14 wins, 3 losses, P/L $6,350)
+    Trades entered AT/AFTER cutoff (kept)   : 22 (16 wins, 6 losses)
+    Win rate (kept)                         : 72.7%
+    P/L (kept)                              : $4,500
+    P/L delta vs baseline                   : $-6,350
+
+  Cutoff: 12:00 ET
+    Trades entered BEFORE cutoff (skipped)  : 18 (15 wins, 3 losses, P/L $6,945)
+    Trades entered AT/AFTER cutoff (kept)   : 21 (15 wins, 6 losses)
+    Win rate (kept)                         : 71.4%
+    P/L (kept)                              : $3,905
+    P/L delta vs baseline                   : $-6,945
+
+Full table:
+  cutoff  trades_before_cutoff  wins_before_cutoff  losses_before_cutoff  trades_kept_after_cutoff  wins_kept  losses_kept  win_rate_kept  pnl_kept  pnl_delta_vs_baseline
+11:00 ET                     5                   3                     2                        34         27            7       0.794118   11060.0                  210.0
+11:30 ET                    17                  14                     3                        22         16            6       0.727273    4500.0                -6350.0
+12:00 ET                    18                  15                     3                        21         15            6       0.714286    3905.0                -6945.0
+
+════════════════════════════════════════════════════════════════════════════════
+SECTION 2: ENTRY-TIME-SAFE RANGE / GAP FILTERS (TRADABLE)
+════════════════════════════════════════════════════════════════════════════════
+
+WHY THESE ARE TRADABLE:
+  - prior_day_range_pts: yesterday's full High–Low range. Settled before today's
+    open. A persistently wide prior day is a rough proxy for elevated-volatility
+    regime entering today. Knowable from the previous session's close.
+  - open_gap_abs_pts: abs(today's 09:30 open − yesterday's close). Knowable at
+    market open, before entry.
+  - entry_move_from_daily_open_abs_pts: abs(underlyingOpen at entry −
+    today's 09:30 open price). Measures how far SPX has moved from the market
+    open by the time we enter. Positive = up from open; negative = down.
+    Knowable AT ENTRY because the daily open (09:30) precedes all trades in
+    this sample (earliest entry 10:55).
+
+WHAT IS NOT USED:
+  daily High, daily Low, daily Close, underlyingClose — all are end-of-day or
+  intraday future values relative to entry, and are NOT used here.
+
+METHODOLOGY:
+  Median-split and 75th-percentile-split binary filters for each feature.
+  "Skip" means: exclude trades where the feature exceeds the threshold.
+  Because these features are entry-time-safe, this IS a legitimate
+  forward-looking counterfactual.
+
+⚠ LIMITATION: Prior-day range and gap are weak predictors of intraday movement
+  on a specific day. With 39 trades, the signal-to-noise ratio is low. These
+  filters are a starting point, not a proven edge.
+
+  Filter: Skip if prior_day_range > median (60.7 pts) [entry-safe]
+    Trades skipped   : 16 (13 wins, 3 losses)
+    Trades kept      : 23 (17 wins, 6 losses)
+    Win rate (kept)  : 73.9%
+    P/L (kept)       : $5,685
+    P/L delta        : $-5,165
+
+  Filter: Skip if prior_day_range > p75 (73.1 pts) [entry-safe]
+    Trades skipped   : 9 (7 wins, 2 losses)
+    Trades kept      : 30 (23 wins, 7 losses)
+    Win rate (kept)  : 76.7%
+    P/L (kept)       : $7,425
+    P/L delta        : $-3,425
+
+  Filter: Skip if abs(open_gap) > median (13.6 pts) [entry-safe]
+    Trades skipped   : 17 (14 wins, 3 losses)
+    Trades kept      : 22 (16 wins, 6 losses)
+    Win rate (kept)  : 72.7%
+    P/L (kept)       : $5,350
+    P/L delta        : $-5,500
+
+  Filter: Skip if abs(open_gap) > p75 (25.9 pts) [entry-safe]
+    Trades skipped   : 8 (7 wins, 1 losses)
+    Trades kept      : 31 (23 wins, 8 losses)
+    Win rate (kept)  : 74.2%
+    P/L (kept)       : $8,295
+    P/L delta        : $-2,555
+
+  Filter: Skip if abs(entry_move_from_open) > median (28.8 pts) [entry-safe]
+    Trades skipped   : 18 (16 wins, 2 losses)
+    Trades kept      : 21 (14 wins, 7 losses)
+    Win rate (kept)  : 66.7%
+    P/L (kept)       : $3,770
+    P/L delta        : $-7,080
+
+  Filter: Skip if abs(entry_move_from_open) > p75 (41.9 pts) [entry-safe]
+    Trades skipped   : 9 (7 wins, 2 losses)
+    Trades kept      : 30 (23 wins, 7 losses)
+    Win rate (kept)  : 76.7%
+    P/L (kept)       : $8,235
+    P/L delta        : $-2,615
+
+Full table:
+                                                            filter  trades_skipped  wins_skipped  losses_skipped  trades_kept  wins_kept  losses_kept  win_rate_kept  pnl_kept  pnl_delta_vs_baseline
+          Skip if prior_day_range > median (60.7 pts) [entry-safe]              16            13               3           23         17            6       0.739130    5685.0                -5165.0
+             Skip if prior_day_range > p75 (73.1 pts) [entry-safe]               9             7               2           30         23            7       0.766667    7425.0                -3425.0
+            Skip if abs(open_gap) > median (13.6 pts) [entry-safe]              17            14               3           22         16            6       0.727273    5350.0                -5500.0
+               Skip if abs(open_gap) > p75 (25.9 pts) [entry-safe]               8             7               1           31         23            8       0.741935    8295.0                -2555.0
+Skip if abs(entry_move_from_open) > median (28.8 pts) [entry-safe]              18            16               2           21         14            7       0.666667    3770.0                -7080.0
+   Skip if abs(entry_move_from_open) > p75 (41.9 pts) [entry-safe]               9             7               2           30         23            7       0.766667    8235.0                -2615.0
+
+════════════════════════════════════════════════════════════════════════════════
+SECTION 3: ENTRY-TIME-SAFE FEATURES PER TRADE
+════════════════════════════════════════════════════════════════════════════════
+(entry_move_from_daily_open_pts positive = SPX moved UP from 09:30 open to entry)
+
+        openDate outcome   pnl  prior_day_range_pts  open_gap_pts  entry_move_from_daily_open_pts  entry_move_from_daily_open_abs_pts
+2026-06-12 13:25     WIN   135                  NaN           NaN                             NaN                                 NaN
+2026-06-12 12:05     WIN  1240                  NaN           NaN                             NaN                                 NaN
+2026-06-12 11:15     WIN  1215                  NaN           NaN                             NaN                                 NaN
+2026-06-04 13:55     WIN   395            54.129883    -37.140137                       72.179961                           72.179961
+2026-06-04 13:05     WIN   570            54.129883    -37.140137                       65.339961                           65.339961
+2026-06-02 11:25     WIN   235            55.050293     -4.560059                       23.300098                           23.300098
+2026-06-01 12:35    LOSS  -585            35.830078      2.229980                        6.099961                            6.099961
+2026-06-01 13:40    LOSS  -485            35.830078      2.229980                       18.879961                           18.879961
+2026-06-01 11:10     WIN   670            35.830078      2.229980                       -5.730039                            5.730039
+2026-05-29 12:20    LOSS  -955            60.680176     15.700195                        6.139922                            6.139922
+2026-05-29 11:05     WIN   770            60.680176     15.700195                        1.439922                            1.439922
+2026-05-28 14:00    LOSS  -170            31.000000     -0.540039                       44.430176                           44.430176
+2026-05-28 12:30     WIN   400            31.000000     -0.540039                       41.330176                           41.330176
+2026-05-28 11:05     WIN   660            31.000000     -0.540039                       34.500176                           34.500176
+2026-05-26 12:50     WIN   540            43.029785     38.319824                       -5.120039                            5.120039
+2026-05-26 11:25     WIN   810            43.029785     38.319824                        7.869961                            7.869961
+2026-05-26 10:55    LOSS -1130            43.029785     38.319824                       21.469961                           21.469961
+2026-05-22 12:55    LOSS  -135            76.479981     23.099609                       23.670176                           23.670176
+2026-05-22 11:00     WIN   845            76.479981     23.099609                       13.200176                           13.200176
+2026-05-20 11:50     WIN   595            61.639648     15.580078                       56.680059                           56.680059
+2026-05-14 12:35     WIN   650            84.910156     10.149902                       43.600098                           43.600098
+2026-05-14 12:10    LOSS  -950            84.910156     10.149902                       59.280098                           59.280098
+2026-05-14 11:20     WIN   685            84.910156     10.149902                       51.400098                           51.400098
+2026-05-14 10:55     WIN   750            84.910156     10.149902                       40.870098                           40.870098
+2026-05-13 13:30     WIN   245            71.029785      8.160156                       38.979883                           38.979883
+2026-05-13 12:35     WIN   515            71.029785      8.160156                       30.169883                           30.169883
+2026-05-13 11:00    LOSS -1065            71.029785      8.160156                        1.469883                            1.469883
+2026-05-11 11:15     WIN   585            38.529785    -13.620117                       27.479941                           27.479941
+2026-05-11 12:30     WIN   300            38.529785    -13.620117                       40.219941                           40.219941
+2026-05-08 13:10     WIN   360            63.770020     25.860352                       33.749785                           33.749785
+2026-05-08 11:00     WIN   560            63.770020     25.860352                       30.769785                           30.769785
+2026-05-07 12:20     WIN   675            75.080078     11.659668                      -35.419785                           35.419785
+2026-05-06 13:50     WIN   335            39.639649     34.919922                       48.439863                           48.439863
+2026-05-06 10:55     WIN   505            39.639649     34.919922                       48.829863                           48.829863
+2026-05-05 10:55     WIN   530            70.419922     32.870117                       19.449883                           19.449883
+2026-05-04 10:55    LOSS  -865            43.200196     -1.740234                       14.500117                           14.500117
+2026-05-01 13:15     WIN   315            93.680176     25.530273                       13.389961                           13.389961
+2026-05-01 11:10     WIN   590            93.680176     25.530273                       15.079961                           15.079961
+2026-04-30 13:40     WIN   510                  NaN           NaN                       26.500000                           26.500000
+
+
+NEXT STEPS
+----------
+1. Paper-forward-test any promising filter on the next 50+ trades before
+   trusting it. 39 trades is triage, not proof.
+2. If time-of-day filter shows positive P/L delta with acceptable win-rate
+   retention: add a configurable entry cutoff to your bot (e.g., skip entries
+   before 11:30 ET).
+3. If prior-day range filter shows positive delta: cross-reference with a
+   volatility proxy (e.g., VIX open) for a more robust regime signal.
+4. For intraday path-based risk management (first-breach stop), see
+   INTRADAY_STOP_SIMULATION.txt.

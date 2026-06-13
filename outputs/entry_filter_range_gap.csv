@@ -1,0 +1,7 @@
+filter,trades_skipped,wins_skipped,losses_skipped,trades_kept,wins_kept,losses_kept,win_rate_kept,pnl_kept,pnl_delta_vs_baseline,baseline_total,baseline_win_rate,baseline_pnl
+Skip if prior_day_range > median (60.7 pts) [entry-safe],16,13,3,23,17,6,0.7391304347826086,5685.0,-5165.0,39,0.7692307692307693,10850.0
+Skip if prior_day_range > p75 (73.1 pts) [entry-safe],9,7,2,30,23,7,0.7666666666666667,7425.0,-3425.0,39,0.7692307692307693,10850.0
+Skip if abs(open_gap) > median (13.6 pts) [entry-safe],17,14,3,22,16,6,0.7272727272727273,5350.0,-5500.0,39,0.7692307692307693,10850.0
+Skip if abs(open_gap) > p75 (25.9 pts) [entry-safe],8,7,1,31,23,8,0.7419354838709677,8295.0,-2555.0,39,0.7692307692307693,10850.0
+Skip if abs(entry_move_from_open) > median (28.8 pts) [entry-safe],18,16,2,21,14,7,0.6666666666666666,3770.0,-7080.0,39,0.7692307692307693,10850.0
+Skip if abs(entry_move_from_open) > p75 (41.9 pts) [entry-safe],9,7,2,30,23,7,0.7666666666666667,8235.0,-2615.0,39,0.7692307692307693,10850.0

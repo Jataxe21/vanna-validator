@@ -1,0 +1,4 @@
+cutoff,trades_before_cutoff,wins_before_cutoff,losses_before_cutoff,pnl_before_cutoff,trades_kept_after_cutoff,wins_kept,losses_kept,win_rate_kept,pnl_kept,pnl_delta_vs_baseline,baseline_total,baseline_wins,baseline_losses,baseline_pnl
+11:00 ET,5,3,2,-210.0,34,27,7,0.7941176470588235,11060.0,210.0,39,30,9,10850.0
+11:30 ET,17,14,3,6350.0,22,16,6,0.7272727272727273,4500.0,-6350.0,39,30,9,10850.0
+12:00 ET,18,15,3,6945.0,21,15,6,0.7142857142857143,3905.0,-6945.0,39,30,9,10850.0

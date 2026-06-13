@@ -1,0 +1,130 @@
+
+MOVEMENT / GAMMA PRESSURE DIAGNOSTIC REPORT
+============================================
+
+╔══════════════════════════════════════════════════════════════════════════╗
+║  POST-HOC DIAGNOSTIC — NOT A TRADABLE STRATEGY                             ║
+║                                                                              ║
+║  ALL movement / exit-distance metrics in this report are computed from      ║
+║  EXIT data (underlyingClose at trade exit). They are OUTCOMES, not inputs   ║
+║  you can observe at entry or mid-trade. Thresholds derived from exit        ║
+║  movement RE-DESCRIBE the losers after the fact; they do not predict them.  ║
+║                                                                              ║
+║  For TRADABLE counterfactuals, see:                                          ║
+║    • outputs/ENTRY_FILTER_REPORT.txt  (entry-time & prior-day range filters)║
+║    • outputs/INTRADAY_STOP_SIMULATION.txt  (first-breach stop, if intraday  ║
+║      data is present)                                                        ║
+╚══════════════════════════════════════════════════════════════════════════╝
+
+WHAT THIS DIAGNOSTIC TESTS
+---------------------------
+It answers: "After the fact, on trades that lost — how large was the underlying
+move and how far was price from the body strike at exit?" This is useful for
+understanding the MECHANISM of losses, not for predicting or filtering them.
+
+DATA LIMITATION
+---------------
+This uses entry and exit underlying prices only, NOT second-by-second or
+minute-by-minute SPX path data. Every metric below (underlying_move_abs_pts,
+abs_exit_distance_from_center) is measured AT THE ACTUAL EXIT and is therefore
+unknowable at entry. Do NOT attempt to use these numbers as live rules.
+
+BASELINE
+--------
+Total trades: 39
+Wins: 30
+Losses: 9
+Total P/L: $10,850
+Baseline win rate: 76.9%
+
+CORE FINDINGS (DIAGNOSTIC ONLY)
+---------------------------------
+Correlation: P/L vs absolute SPX move during trade (EXIT metric): -0.546
+Correlation: P/L vs absolute exit distance from center strike (EXIT metric): -0.747
+
+Loss movement distribution (EXIT-MEASURED — post-hoc):
+count     9.000000
+mean     16.273333
+std       6.520257
+min       4.710000
+25%      14.310000
+50%      15.990000
+75%      17.390000
+max      28.330000
+
+Win movement distribution (EXIT-MEASURED — post-hoc):
+count    30.000000
+mean      7.254000
+std       4.409019
+min       0.500000
+25%       4.112500
+50%       6.755000
+75%      10.317500
+max      19.160000
+
+BEST POST-HOC SEPARATION THRESHOLD (DIAGNOSTIC ONLY — BIASED, NOT TRADABLE)
+-----------------------------------------------------------------------------
+⚠ WARNING: The number below is derived from EXIT-measured movement. Because a
+  large loss BY DEFINITION has a large exit move, "flag trades that moved >=X pts"
+  is a circular re-description of the losers. It is NOT a forward-looking signal
+  you can act on at trade entry. The P/L delta shown is similarly BIASED.
+
+Threshold: 15.0 SPX points (exit-measured, post-hoc)
+Flagged trades: 7
+Flagged losses: 6 of 9 (66.7%)
+Flagged winners: 1 of 30 (3.3%)
+P/L of flagged trades: $-4,310
+If flagged trades had been skipped, kept P/L would be: $15,160
+P/L impact if skipped (POST-HOC BIASED — uses exit-measured movement,
+  cannot be acted on at entry): $4,310
+
+IMPORTANT INTERPRETATION
+------------------------
+A profitable flagged bucket does NOT automatically mean the threshold is bad.
+It may mean winners also move, but losses become catastrophic when movement
+continues. With minute-level data, the correct implementation may be:
+- reduce size after X points,
+- take profit earlier when centered,
+- exit only if move is away from center plus trade price deteriorates,
+- avoid entries when price is already unstable.
+
+POST-HOC THRESHOLD TABLE (EXIT DATA — DIAGNOSTIC ONLY, BIASED)
+---------------------------------------------------------------
+NOTE: "pnl_impact_if_skipped_POST_HOC_BIASED" uses exit-measured movement and
+cannot be acted on at entry. It is labeled BIASED to prevent misuse.
+ threshold_pts  flagged_trades  flagged_wins  flagged_losses  loss_capture_rate  winner_penalty_rate  flagged_total_pnl  kept_total_pnl  pnl_impact_if_skipped_POST_HOC_BIASED  post_hoc_separation_score (diagnostic only, biased)
+           2.5              35            26               9           1.000000             0.866667             8780.0          2070.0                                -8780.0                                             0.255333
+           5.0              28            20               8           0.888889             0.666667             5430.0          5420.0                                -5430.0                                             0.568111
+           7.5              21            13               8           0.888889             0.433333             1900.0          8950.0                                -1900.0                                             1.154444
+          10.0              17             9               8           0.888889             0.300000              160.0         10690.0                                 -160.0                                             1.461778
+          12.5              11             4               7           0.777778             0.133333            -2725.0         13575.0                                 2725.0                                             1.694722
+          15.0               7             1               6           0.666667             0.033333            -4310.0         15160.0                                 4310.0                                             1.731000
+          17.5               3             1               2           0.222222             0.033333             -410.0         11260.0                                  410.0                                             0.452111
+          20.0               2             0               2           0.222222             0.000000            -1650.0         12500.0                                 1650.0                                             0.609444
+          22.5               1             0               1           0.111111             0.000000             -585.0         11435.0                                  585.0                                             0.280722
+          25.0               1             0               1           0.111111             0.000000             -585.0         11435.0                                  585.0                                             0.280722
+
+CENTER STRIKE EXIT-DISTANCE SUMMARY (POST-HOC — EXIT DATA)
+------------------------------------------------------------
+abs_exit_distance_from_center is measured at exit — NOT known at entry.
+
+exit_distance_bucket  trades  wins  losses  total_pnl      avg_pnl  avg_underlying_move  win_rate
+                 0-5      10    10       0       4635   463.500000             6.237000  1.000000
+                5-10      13    13       0       7970   613.076923             7.380769  1.000000
+               10-15       6     5       1       3040   506.666667             5.833333  0.833333
+               15-20       2     0       2       -620  -310.000000            12.795000  0.000000
+               20-30       5     2       3      -1025  -205.000000            18.144000  0.400000
+               30-50       3     0       3      -3150 -1050.000000            18.150000  0.000000
+                 50+       0     0       0          0          NaN                  NaN       NaN
+
+PRACTICAL NEXT STEP
+-------------------
+Do not automate a hard stop from this report alone. Every input here is
+post-hoc exit data; using it as a live signal would produce look-ahead bias.
+
+The genuinely actionable next steps are:
+1. See ENTRY_FILTER_REPORT.txt for time-of-day and prior-day range filters
+   that ARE knowable at entry.
+2. See INTRADAY_STOP_SIMULATION.txt for a first-breach stop simulation using
+   intraday SPX path data — the tradable counterfactual.
+3. Collect 50+ more trades before drawing firm conclusions (39-trade sample).
