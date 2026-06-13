@@ -1,0 +1,51 @@
+name: Run Vanna Proxy Analysis
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'analysis/vanna_analysis.py'
+      - 'data/*.csv'
+      - 'requirements.txt'
+      - '.github/workflows/run-vanna-analysis.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run proxy vanna analysis
+        run: python analysis/vanna_analysis.py
+
+      - name: Upload analysis outputs as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vanna-proxy-analysis-outputs
+          path: outputs/
+
+      - name: Commit generated outputs back to repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add outputs/
+          if git diff --cached --quiet; then
+            echo "No output changes to commit."
+          else
+            git commit -m "Generate vanna proxy analysis outputs"
+            git push
+          fi
