@@ -6,6 +6,8 @@ on:
     branches: [main]
     paths:
       - 'analysis/vanna_analysis.py'
+      - 'analysis/entry_filters.py'
+      - 'analysis/intraday_sim.py'
       - 'data/*.csv'
       - 'requirements.txt'
       - '.github/workflows/run-vanna-analysis.yml'
