@@ -6,11 +6,6 @@ __pycache__/
 dist/
 build/
 
-# Outputs
-outputs/*.png
-outputs/*.csv
-outputs/*.txt
-
 # IDE
 .vscode/
 .idea/
