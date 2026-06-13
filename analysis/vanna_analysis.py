@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Trigger: re-run analysis to regenerate outputs/ reports (outputs no longer gitignored).
 """
 0DTE SPX Short Iron Butterfly — Loss Attribution & Tradable Filter Analysis
 
@@ -365,7 +366,7 @@ NEXT STEPS
 MOVEMENT / GAMMA PRESSURE DIAGNOSTIC REPORT
 ============================================
 
-╔══════════════════════════════════════════════════════════════════════════════╗
+╔══════════════════════════════════════════════════════════════════════════╗
 ║  POST-HOC DIAGNOSTIC — NOT A TRADABLE STRATEGY                             ║
 ║                                                                              ║
 ║  ALL movement / exit-distance metrics in this report are computed from      ║
@@ -377,7 +378,7 @@ MOVEMENT / GAMMA PRESSURE DIAGNOSTIC REPORT
 ║    • outputs/ENTRY_FILTER_REPORT.txt  (entry-time & prior-day range filters)║
 ║    • outputs/INTRADAY_STOP_SIMULATION.txt  (first-breach stop, if intraday  ║
 ║      data is present)                                                        ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+╚══════════════════════════════════════════════════════════════════════════╝
 
 WHAT THIS DIAGNOSTIC TESTS
 ---------------------------
