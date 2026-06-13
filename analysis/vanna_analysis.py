@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Phase 1: Vanna Proxy Validator
+Phase 1B: Vanna Proxy + Movement/Gamma Pressure Validator
 
 Uses the data currently available in this repo:
 - completed 0DTE SPX iron butterfly trades
@@ -8,8 +8,10 @@ Uses the data currently available in this repo:
 
 This is NOT true strike-level vanna/GEX modeling because the repo does not
 contain historical option-chain Greeks, IV, OI, volume, or bid/ask data.
-It is a proxy regime analysis: do losses cluster on high range / high volatility
-/ high underlying-move days enough to justify deeper true options-chain work?
+It is a proxy regime analysis plus a movement/gamma-pressure diagnostic:
+- do losses cluster on high range / high volatility / high underlying-move days?
+- do losses cluster when SPX moves too far during the trade?
+- what movement threshold is the best practical kill-switch candidate?
 """
 
 from pathlib import Path
@@ -35,6 +37,8 @@ class VannaProxyValidator:
         self.trades = None
         self.spx = None
         self.summary = {}
+        self.movement_thresholds = None
+        self.center_distance_summary = None
 
     def load_data(self):
         self.trades = pd.read_csv(TRADES_FILE)
@@ -46,6 +50,8 @@ class VannaProxyValidator:
         self.trades["pnl"] = pd.to_numeric(self.trades["pnl"], errors="coerce")
         self.trades["underlyingOpen"] = pd.to_numeric(self.trades["underlyingOpen"], errors="coerce")
         self.trades["underlyingClose"] = pd.to_numeric(self.trades["underlyingClose"], errors="coerce")
+        self.trades["openPrice"] = pd.to_numeric(self.trades.get("openPrice"), errors="coerce")
+        self.trades["closePrice"] = pd.to_numeric(self.trades.get("closePrice"), errors="coerce")
         self.trades["outcome"] = np.where(self.trades["pnl"] > 0, "WIN", "LOSS")
 
         self.spx["Date"] = pd.to_datetime(self.spx["Date"])
@@ -57,7 +63,7 @@ class VannaProxyValidator:
 
     @staticmethod
     def center_strike(description):
-        # Example: +7,385 put, -7,450 put, -7,450 call, +7,490 call
+        """Extract repeated short/body strike from an iron butterfly description."""
         strikes = []
         for raw_part in str(description).split(", "):
             part = raw_part.replace(",", "")
@@ -108,7 +114,11 @@ class VannaProxyValidator:
         trades["underlying_move_pct"] = trades["underlying_move_pts"] / trades["underlyingOpen"]
         trades["entry_distance_from_center"] = trades["underlyingOpen"] - trades["center_strike"]
         trades["exit_distance_from_center"] = trades["underlyingClose"] - trades["center_strike"]
+        trades["abs_entry_distance_from_center"] = trades["entry_distance_from_center"].abs()
+        trades["abs_exit_distance_from_center"] = trades["exit_distance_from_center"].abs()
+        trades["distance_expansion_pts"] = trades["abs_exit_distance_from_center"] - trades["abs_entry_distance_from_center"]
         trades["trade_duration_min"] = (trades["closeDate"] - trades["openDate"]).dt.total_seconds() / 60
+        trades["pnl_per_minute"] = trades["pnl"] / trades["trade_duration_min"].replace(0, np.nan)
 
         large_move_cutoff = trades["underlying_move_abs_pts"].quantile(0.67)
         trades["loss_attribution"] = "Winner"
@@ -124,7 +134,7 @@ class VannaProxyValidator:
         wins = trades[trades["outcome"] == "WIN"]
         losses = trades[trades["outcome"] == "LOSS"]
 
-        env_summary = trades.groupby("proxy_vanna_env", observed=False).agg(
+        env_summary = trades.dropna(subset=["proxy_vanna_env"]).groupby("proxy_vanna_env", observed=False).agg(
             trades=("pnl", "size"),
             wins=("outcome", lambda s: int((s == "WIN").sum())),
             losses=("outcome", lambda s: int((s == "LOSS").sum())),
@@ -149,6 +159,8 @@ class VannaProxyValidator:
             "total_trades": int(len(trades)),
             "wins": int(len(wins)),
             "losses": int(len(losses)),
+            "classified_env_trades": int(trades["proxy_vanna_env"].notna().sum()),
+            "unclassified_env_trades": int(trades["proxy_vanna_env"].isna().sum()),
             "baseline_win_rate": baseline_win_rate,
             "baseline_pnl": baseline_pnl,
             "high_proxy_vanna_losses": high_losses,
@@ -162,17 +174,89 @@ class VannaProxyValidator:
             "mannwhitney_p_value": mw_p,
             "corr_pnl_proxy_vanna_score": float(trades[["pnl", "proxy_vanna_score"]].corr().iloc[0, 1]),
             "corr_pnl_abs_underlying_move": float(trades[["pnl", "underlying_move_abs_pts"]].corr().iloc[0, 1]),
+            "corr_pnl_abs_exit_distance": float(trades[["pnl", "abs_exit_distance_from_center"]].corr().iloc[0, 1]),
             "loss_attribution": losses["loss_attribution"].value_counts().to_dict(),
             "env_summary": env_summary,
         }
+
+    def analyze_movement_thresholds(self):
+        """Test practical movement/gamma-pressure thresholds using completed trade data.
+
+        This is not a perfect intraday stop simulation because we only know entry and exit
+        underlying prices, not the full path. It is still useful for identifying whether
+        losses are concentrated in trades that ultimately experienced large movement.
+        """
+        trades = self.trades.copy()
+        total_losses = int((trades["outcome"] == "LOSS").sum())
+        total_wins = int((trades["outcome"] == "WIN").sum())
+        baseline_pnl = float(trades["pnl"].sum())
+
+        thresholds = [2.5, 5, 7.5, 10, 12.5, 15, 17.5, 20, 22.5, 25]
+        rows = []
+        for threshold in thresholds:
+            flagged = trades[trades["underlying_move_abs_pts"] >= threshold]
+            kept = trades[trades["underlying_move_abs_pts"] < threshold]
+            flagged_losses = int((flagged["outcome"] == "LOSS").sum())
+            flagged_wins = int((flagged["outcome"] == "WIN").sum())
+            kept_losses = int((kept["outcome"] == "LOSS").sum())
+            kept_wins = int((kept["outcome"] == "WIN").sum())
+            rows.append({
+                "threshold_pts": threshold,
+                "flagged_trades": int(len(flagged)),
+                "flagged_wins": flagged_wins,
+                "flagged_losses": flagged_losses,
+                "kept_trades": int(len(kept)),
+                "kept_wins": kept_wins,
+                "kept_losses": kept_losses,
+                "loss_capture_rate": flagged_losses / total_losses if total_losses else np.nan,
+                "winner_penalty_rate": flagged_wins / total_wins if total_wins else np.nan,
+                "flagged_total_pnl": float(flagged["pnl"].sum()),
+                "kept_total_pnl": float(kept["pnl"].sum()),
+                "kept_win_rate": kept_wins / len(kept) if len(kept) else np.nan,
+                "pnl_removed_if_skipped": float(flagged["pnl"].sum()),
+                "pnl_delta_if_skipped": float(kept["pnl"].sum() - baseline_pnl),
+                "losses_avoided_per_winner_sacrificed": flagged_losses / flagged_wins if flagged_wins else np.inf,
+            })
+
+        df = pd.DataFrame(rows)
+        # Candidate score: capture losses, minimize sacrificed winners, avoid killing too much sample.
+        df["kill_switch_score"] = (
+            2.0 * df["loss_capture_rate"].fillna(0)
+            - 1.0 * df["winner_penalty_rate"].fillna(0)
+            + 0.0001 * (-df["pnl_removed_if_skipped"].fillna(0))
+        )
+        self.movement_thresholds = df
+
+        # Center distance diagnostics.
+        distance_bins = [0, 5, 10, 15, 20, 30, 50, np.inf]
+        trades["exit_distance_bucket"] = pd.cut(
+            trades["abs_exit_distance_from_center"],
+            bins=distance_bins,
+            labels=["0-5", "5-10", "10-15", "15-20", "20-30", "30-50", "50+"],
+            include_lowest=True,
+        )
+        center_summary = trades.groupby("exit_distance_bucket", observed=False).agg(
+            trades=("pnl", "size"),
+            wins=("outcome", lambda s: int((s == "WIN").sum())),
+            losses=("outcome", lambda s: int((s == "LOSS").sum())),
+            total_pnl=("pnl", "sum"),
+            avg_pnl=("pnl", "mean"),
+            avg_underlying_move=("underlying_move_abs_pts", "mean"),
+        ).reset_index()
+        center_summary["win_rate"] = center_summary["wins"] / center_summary["trades"].replace(0, np.nan)
+        self.center_distance_summary = center_summary
 
     def write_outputs(self):
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         self.trades.to_csv(OUTPUT_DIR / "trade_proxy_analysis.csv", index=False)
         self.spx.to_csv(OUTPUT_DIR / "spx_proxy_regimes.csv", index=False)
         self.summary["env_summary"].to_csv(OUTPUT_DIR / "environment_summary.csv", index=False)
+        self.movement_thresholds.to_csv(OUTPUT_DIR / "movement_threshold_analysis.csv", index=False)
+        self.center_distance_summary.to_csv(OUTPUT_DIR / "center_strike_distance_analysis.csv", index=False)
         self.write_report()
+        self.write_movement_report()
         self.write_charts()
+        self.write_movement_charts()
 
     def write_report(self):
         s = self.summary
@@ -194,6 +278,8 @@ Wins: {s['wins']}
 Losses: {s['losses']}
 Baseline win rate: {s['baseline_win_rate']:.1%}
 Baseline total P/L: ${s['baseline_pnl']:,.0f}
+Proxy-regime classified trades: {s['classified_env_trades']}
+Proxy-regime unclassified trades: {s['unclassified_env_trades']}  (usually caused by missing SPX daily row)
 
 KEY QUESTION
 ------------
@@ -212,6 +298,7 @@ CORRELATIONS
 ------------
 P/L vs proxy-vanna score: {s['corr_pnl_proxy_vanna_score']:.3f}
 P/L vs absolute underlying move: {s['corr_pnl_abs_underlying_move']:.3f}
+P/L vs absolute exit distance from center strike: {s['corr_pnl_abs_exit_distance']:.3f}
 
 COUNTERFACTUAL: SKIP HIGH PROXY-VANNA DAYS
 ------------------------------------------
@@ -233,10 +320,106 @@ NEXT STEPS
 ----------
 1. Treat this as a screening test, not proof.
 2. If high proxy-vanna days explain many losses, paper-test a no-trade filter.
-3. For true vanna/GEX, collect historical SPX chains with IV, delta, gamma, vega, OI, and volume.
-4. Keep sample-size discipline: 39 trades is useful for triage, not final proof.
+3. If movement/gamma pressure is stronger, use MOVEMENT_PRESSURE_REPORT.txt first.
+4. For true vanna/GEX, collect historical SPX chains with IV, delta, gamma, vega, OI, and volume.
+5. Keep sample-size discipline: 39 trades is useful for triage, not final proof.
 """)
         (OUTPUT_DIR / "VANNA_PROXY_REPORT.txt").write_text(report)
+
+    def write_movement_report(self):
+        trades = self.trades
+        losses = trades[trades["outcome"] == "LOSS"]
+        wins = trades[trades["outcome"] == "WIN"]
+        thresholds = self.movement_thresholds.copy()
+
+        # Avoid recommending thresholds that flag almost the entire book or almost nothing.
+        candidate_pool = thresholds[(thresholds["flagged_trades"] >= 3) & (thresholds["kept_trades"] >= 10)].copy()
+        if candidate_pool.empty:
+            candidate_pool = thresholds.copy()
+        best = candidate_pool.sort_values("kill_switch_score", ascending=False).iloc[0]
+
+        loss_move_q = losses["underlying_move_abs_pts"].describe(percentiles=[0.25, 0.5, 0.75]).to_string()
+        win_move_q = wins["underlying_move_abs_pts"].describe(percentiles=[0.25, 0.5, 0.75]).to_string()
+
+        report = f"""
+MOVEMENT / GAMMA PRESSURE VALIDATOR REPORT
+==========================================
+
+WHAT THIS TESTS
+---------------
+This tests the failure mode that showed up in the first proxy analysis:
+losses appear more related to SPX moving too far during the position than to
+high proxy-vanna / high daily volatility regimes.
+
+DATA LIMITATION
+---------------
+This is not a perfect intraday stop-loss backtest because the dataset only has
+entry and exit underlying prices, not second-by-second or minute-by-minute SPX
+path data. Treat the threshold table as a diagnostic for where losses cluster,
+not as a fully executable stop order simulation.
+
+BASELINE
+--------
+Total trades: {len(trades)}
+Wins: {len(wins)}
+Losses: {len(losses)}
+Total P/L: ${trades['pnl'].sum():,.0f}
+Baseline win rate: {(trades['outcome'].eq('WIN').mean()):.1%}
+
+CORE FINDINGS
+-------------
+Correlation: P/L vs absolute SPX move during trade: {self.summary['corr_pnl_abs_underlying_move']:.3f}
+Correlation: P/L vs absolute exit distance from center strike: {self.summary['corr_pnl_abs_exit_distance']:.3f}
+
+Loss movement distribution:
+{loss_move_q}
+
+Win movement distribution:
+{win_move_q}
+
+BEST DIAGNOSTIC THRESHOLD CANDIDATE
+-----------------------------------
+Threshold: {best['threshold_pts']} SPX points
+Flagged trades: {int(best['flagged_trades'])}
+Flagged losses: {int(best['flagged_losses'])} of {len(losses)} ({best['loss_capture_rate']:.1%})
+Flagged winners: {int(best['flagged_wins'])} of {len(wins)} ({best['winner_penalty_rate']:.1%})
+P/L of flagged trades: ${best['flagged_total_pnl']:,.0f}
+If skipped entirely, kept P/L would be: ${best['kept_total_pnl']:,.0f}
+P/L delta if skipped entirely: ${best['pnl_delta_if_skipped']:,.0f}
+
+IMPORTANT INTERPRETATION
+------------------------
+A profitable flagged bucket does NOT automatically mean the threshold is bad.
+It may mean winners also move, but losses become catastrophic when movement
+continues. With minute-level data, the correct implementation may be:
+- reduce size after X points,
+- take profit earlier when centered,
+- exit only if move is away from center plus trade price deteriorates,
+- avoid entries when price is already unstable.
+
+THRESHOLD TABLE
+---------------
+"""
+        display_cols = [
+            "threshold_pts", "flagged_trades", "flagged_wins", "flagged_losses",
+            "loss_capture_rate", "winner_penalty_rate", "flagged_total_pnl",
+            "kept_total_pnl", "pnl_delta_if_skipped", "kill_switch_score",
+        ]
+        report += thresholds[display_cols].to_string(index=False)
+        report += "\n\nCENTER STRIKE DISTANCE SUMMARY\n------------------------------\n"
+        report += self.center_distance_summary.to_string(index=False)
+        report += dedent("""
+
+PRACTICAL NEXT STEP
+-------------------
+Do not immediately automate a hard stop from this alone. The smart next step is
+adding intraday SPX path data around each trade, then testing whether a movement
+threshold would have triggered before final exit and at what option price.
+
+Until then, this report should be used to identify candidate risk guards and
+entry-quality checks, not as final production logic.
+""")
+        (OUTPUT_DIR / "MOVEMENT_PRESSURE_REPORT.txt").write_text(report)
 
     def write_charts(self):
         trades = self.trades
@@ -285,10 +468,64 @@ NEXT STEPS
         fig.savefig(OUTPUT_DIR / "vanna_proxy_summary.png", dpi=200, bbox_inches="tight")
         plt.close(fig)
 
+    def write_movement_charts(self):
+        trades = self.trades
+        wins = trades[trades["outcome"] == "WIN"]
+        losses = trades[trades["outcome"] == "LOSS"]
+        thresholds = self.movement_thresholds
+
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        fig.suptitle("0DTE SPX SIB - Movement / Gamma Pressure Diagnostics", fontsize=15, fontweight="bold")
+
+        ax = axes[0, 0]
+        ax.scatter(wins["underlying_move_abs_pts"], wins["pnl"], color="green", alpha=0.7, label="Wins")
+        ax.scatter(losses["underlying_move_abs_pts"], losses["pnl"], color="red", alpha=0.8, label="Losses")
+        ax.axhline(0, color="black", linestyle="--")
+        ax.set_title("P/L vs Absolute SPX Move")
+        ax.set_xlabel("Absolute SPX move during trade")
+        ax.set_ylabel("P/L ($)")
+        ax.legend()
+        ax.grid(alpha=0.25)
+
+        ax = axes[0, 1]
+        ax.plot(thresholds["threshold_pts"], thresholds["loss_capture_rate"], marker="o", label="Loss capture rate", color="red")
+        ax.plot(thresholds["threshold_pts"], thresholds["winner_penalty_rate"], marker="o", label="Winner penalty rate", color="green")
+        ax.set_title("Threshold Tradeoff: Losses Captured vs Winners Sacrificed")
+        ax.set_xlabel("Movement threshold (SPX points)")
+        ax.set_ylabel("Rate")
+        ax.set_ylim(0, 1.05)
+        ax.legend()
+        ax.grid(alpha=0.25)
+
+        ax = axes[1, 0]
+        ax.plot(thresholds["threshold_pts"], thresholds["flagged_total_pnl"], marker="o", label="P/L of flagged bucket")
+        ax.plot(thresholds["threshold_pts"], thresholds["kept_total_pnl"], marker="o", label="P/L if kept under threshold")
+        ax.axhline(0, color="black", linestyle="--")
+        ax.set_title("P/L by Movement Threshold Bucket")
+        ax.set_xlabel("Movement threshold (SPX points)")
+        ax.set_ylabel("P/L ($)")
+        ax.legend()
+        ax.grid(alpha=0.25)
+
+        ax = axes[1, 1]
+        ax.scatter(wins["abs_exit_distance_from_center"], wins["pnl"], color="green", alpha=0.7, label="Wins")
+        ax.scatter(losses["abs_exit_distance_from_center"], losses["pnl"], color="red", alpha=0.8, label="Losses")
+        ax.axhline(0, color="black", linestyle="--")
+        ax.set_title("P/L vs Exit Distance from Center Strike")
+        ax.set_xlabel("Absolute exit distance from body strike")
+        ax.set_ylabel("P/L ($)")
+        ax.legend()
+        ax.grid(alpha=0.25)
+
+        plt.tight_layout()
+        fig.savefig(OUTPUT_DIR / "movement_pressure_summary.png", dpi=200, bbox_inches="tight")
+        plt.close(fig)
+
     def run(self):
         self.load_data()
         self.engineer_features()
         self.summarize()
+        self.analyze_movement_thresholds()
         self.write_outputs()
         print(f"Analysis complete. Outputs written to {OUTPUT_DIR}")
 
