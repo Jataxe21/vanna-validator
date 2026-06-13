@@ -43,12 +43,10 @@ HARD_CAP_LOSS_PER_CONTRACT = 1500
 TIMED_EXIT_ET = "15:15"
 ALT_STOP_DISTANCES = [8, 10, 12, 15]
 
-# Reported live total from trades.csv context; used for explicit delta reporting.
-ACTUAL_RECORDED_TOTAL_PNL = 10850.0
-
 CONTRACT_MULTIPLIER = 100.0
 # Mark approximation knobs (documented assumptions; directional only)
 MARK_DISTANCE_CUSHION_PTS = 2.0
+INV_MARK_DISTANCE_CUSHION_PTS = 1.0 / MARK_DISTANCE_CUSHION_PTS
 MARK_DISTANCE_SLOPE = 0.11
 MARK_MAX_MULTIPLE = 3.0
 
@@ -100,7 +98,7 @@ def _estimate_mark(credit: float, distance_pts: float, elapsed_min: float, total
     elapsed_frac = float(np.clip(elapsed_min / total_min, 0.0, 1.0))
 
     # Decay benefit is strongest when price is pinned near the body (small distance).
-    pin_factor = float(np.clip(1.0 - distance_pts / MARK_DISTANCE_CUSHION_PTS, 0.0, 1.0))
+    pin_factor = float(np.clip(1.0 - distance_pts * INV_MARK_DISTANCE_CUSHION_PTS, 0.0, 1.0))
     decay_component = credit * PROFIT_TARGET_FRAC * elapsed_frac * pin_factor
 
     # Distance expansion captures adverse intrinsic pressure when underlying moves away.
@@ -353,11 +351,23 @@ def run_intraday_stop_simulation(
     actual_total_from_data = float(trades["pnl"].sum())
 
     baseline_valid = baseline_df[["est_pnl", "actual_pnl"]].dropna()
-    if len(baseline_valid) > 1 and baseline_valid["est_pnl"].std() > 0 and baseline_valid["actual_pnl"].std() > 0:
+    est_std = baseline_valid["est_pnl"].std()
+    actual_std = baseline_valid["actual_pnl"].std()
+    if (
+        len(baseline_valid) > 1
+        and np.isfinite(est_std)
+        and np.isfinite(actual_std)
+        and est_std > 0
+        and actual_std > 0
+    ):
         baseline_corr = float(baseline_valid["est_pnl"].corr(baseline_valid["actual_pnl"]))
     else:
         baseline_corr = np.nan
-    baseline_mae = float((baseline_valid["est_pnl"] - baseline_valid["actual_pnl"]).abs().mean()) if len(baseline_valid) else np.nan
+    baseline_mae = (
+        float((baseline_valid["est_pnl"] - baseline_valid["actual_pnl"]).abs().mean())
+        if len(baseline_valid)
+        else np.nan
+    )
 
     summary_rows = []
     for dist in ALT_STOP_DISTANCES:
@@ -371,7 +381,7 @@ def run_intraday_stop_simulation(
 
         total_pnl_variant = float(sub["est_pnl"].sum())
         delta_vs_simulated_baseline = total_pnl_variant - simulated_baseline_total
-        delta_vs_actual_recorded = total_pnl_variant - ACTUAL_RECORDED_TOTAL_PNL
+        delta_vs_actual_recorded = total_pnl_variant - actual_total_from_data
 
         summary_rows.append(
             {
@@ -458,6 +468,13 @@ def _write_full_report(
     baseline_corr: float,
     output_dir: Path,
 ) -> None:
+    def _format_datetime_col(series: pd.Series) -> pd.Series:
+        if pd.api.types.is_datetime64_any_dtype(series):
+            formatted = series.dt.strftime("%Y-%m-%d %H:%M")
+        else:
+            formatted = pd.to_datetime(series).dt.strftime("%Y-%m-%d %H:%M")
+        return formatted.fillna("—")
+
     total = len(trades)
     wins = int((trades["pnl"] > 0).sum())
     losses = int((trades["pnl"] <= 0).sum())
@@ -489,8 +506,7 @@ Stop-side behavior is more reliable than precise target timing under this approx
 BASELINE RECONCILIATION CREDIBILITY CHECK
 -----------------------------------------
 Simulated baseline total P/L : ${simulated_baseline_total:,.0f}
-Actual recorded total (data) : ${actual_total_from_data:,.0f}
-Actual recorded total (fixed): ${ACTUAL_RECORDED_TOTAL_PNL:,.0f}
+Actual recorded total        : ${actual_total_from_data:,.0f}
 Mean absolute error (trade)  : ${baseline_mae:,.1f}
 Correlation (sim vs actual)  : {baseline_corr:.3f}
 
@@ -535,8 +551,8 @@ exit_timestamp, est_pnl, and actual_pnl.
             "note",
         ]
     ].copy()
-    detail_display["trade_openDate"] = pd.to_datetime(detail_display["trade_openDate"]).dt.strftime("%Y-%m-%d %H:%M")
-    detail_display["exit_timestamp"] = pd.to_datetime(detail_display["exit_timestamp"]).dt.strftime("%Y-%m-%d %H:%M").fillna("—")
+    detail_display["trade_openDate"] = _format_datetime_col(detail_display["trade_openDate"])
+    detail_display["exit_timestamp"] = _format_datetime_col(detail_display["exit_timestamp"])
     lines.append(detail_display.to_string(index=False))
 
     lines.append("\nINTRADAY DATA SCHEMA USED\n--------------------------")
