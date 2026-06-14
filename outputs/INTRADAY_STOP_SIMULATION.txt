@@ -1,27 +1,26 @@
 
-INTRADAY FIRST-BREACH STOP SIMULATION
+INTRADAY REAL-BASELINE STOP SIMULATION
 ======================================
 
 STATUS: SKIPPED — data/spx_intraday.csv not found.
 
-This simulation requires intraday SPX (or ES futures proxy) 1-minute bar data.
-No intraday data file was detected, so the path-simulation has been skipped.
-All other analyses ran normally.
+This module models the REAL bot exits as the baseline (30% target, 1.5x-credit
+stop, -$1,500 hard cap, 15:15 ET timed exit), then compares alternative
+underlying-distance stops against that baseline.
+
+No intraday data file was detected, so path simulation was skipped. All other
+analyses ran normally.
 
 HOW TO ENABLE THIS SIMULATION
 ------------------------------
-1. Obtain 1-minute SPX (or ES futures) OHLC data covering the date range of
-   your trades (2026-04-30 to 2026-06-12).
-   Sources: Tradovate, Interactive Brokers, Alpaca, Polygon.io, etc.
-
-2. Format the data as a CSV with the following columns (no extra columns
-   required; extra columns are ignored):
+1. Obtain 1-minute SPX (or ES futures) OHLC data covering your trade range (2026-04-30 to 2026-06-12).
+2. Format as CSV columns: timestamp, open, high, low, close.
 
 
 Expected schema for data/spx_intraday.csv
 ------------------------------------------
 Column      Type        Description
-timestamp   datetime    Bar timestamp (e.g., 2026-05-04 10:55:00)
+timestamp   datetime    Bar timestamp (e.g., 2026-05-04 11:00:00)
                         Must be parseable by pd.to_datetime().
                         Timezone: assumed ET (same as trades).
 open        float       Bar open price
@@ -36,20 +35,10 @@ Coverage:  Must span all trade windows in trades.csv
            (from earliest openDate to latest closeDate).
 
 
-3. Save the file as data/spx_intraday.csv in the repository root.
+3. Save as data/spx_intraday.csv in repository root.
+4. Re-run: python analysis/vanna_analysis.py
 
-4. Re-run the analysis:  python analysis/vanna_analysis.py
-
-The intraday simulation will activate automatically and write:
+Outputs generated when intraday file is present:
     outputs/INTRADAY_STOP_SIMULATION.txt
-    outputs/intraday_stop_simulation_trades.csv
     outputs/intraday_stop_simulation_summary.csv
-
-WHY THIS SIMULATION IS THE TRADABLE COUNTERFACTUAL
----------------------------------------------------
-Unlike the exit-distance diagnostic in MOVEMENT_PRESSURE_REPORT.txt (which
-uses exit data and is subject to look-ahead bias), the intraday first-breach
-stop uses ONLY intraday bar data that is available at the moment of the breach
-bar's close. It is a genuinely forward-looking risk management rule and the
-result of running it is the correct number to use for evaluating whether a hard
-stop adds value.
+    outputs/intraday_stop_simulation_trades.csv
