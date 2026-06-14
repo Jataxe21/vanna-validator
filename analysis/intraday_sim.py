@@ -7,25 +7,34 @@ REAL BOT BASELINE MODELED HERE
 - Entry context (not re-simulated): body strike is centered at the max-absolute-GEX strike,
   entry window is 11:00 ET to 14:00 ET, and center_strike extraction from trade description
   is used as the position center.
-- Profit target: close at 30% profit on credit received
-    -> target close mark ~= 0.70 * entry credit.
+- Profit target: close at 30% profit on credit received -> target mark ~= 0.70 * entry credit.
 - Stop loss: close when mark >= 1.5x entry credit.
 - Hard loss cap: per-contract P/L floor of -$1,500.
-- Timed exit: unconditional close at 15:15 ET (45 min before 16:00 ET expiry)
-  if target/stop have not already triggered.
+- Timed exit: unconditional close at 15:15 ET (45 min before 16:00 ET expiry).
+
+BASELINE vs ALTERNATIVE-STOP VARIANTS (clean A/B comparison)
+------------------------------------------------------------
+  * baseline_real (alt_stop_dist is None): real exits only — 1.5x-credit stop,
+      30% target, 15:15 timed exit.
+  * alt_stop_N    (alt_stop_dist = N):     the candidate underlying-distance stop
+      REPLACES the 1.5x-credit stop. Keeps the real 30% target + 15:15 timed exit.
+The 1.5x stop is NOT evaluated inside a variant pass, so a tighter alt stop is
+never pre-empted/masked by the baseline stop firing first.
+
+INTRABAR EXIT-PRIORITY RESOLUTION (documented, conservative)
+------------------------------------------------------------
+A 1-min bar exposes only OHLC, so adverse (high/low) vs favorable (close) ordering
+within a bar is unknown. Resolution: adverse side FIRST (stop/alt-stop via intrabar
+high/low), profit target SECOND (via bar close). Ties resolve AGAINST the position.
 
 IMPORTANT APPROXIMATION (NO INTRADAY OPTION MARKS AVAILABLE)
 -------------------------------------------------------------
-Intraday option prices are unavailable in this repository, so the fly mark is inferred from
-underlying distance to the body strike:
-
+Intraday option prices are unavailable, so the fly mark is inferred from underlying
+distance to the body strike:
     d = abs(underlying - body)
     mark(d, t) ~= credit - decay_component(d, t) + distance_component(d)
-
-where decay is strongest when d is small and time has elapsed, and distance_component grows
-when d moves away from the body. This is a crude approximation and is explicitly treated as
-"directional only". Stop-side behavior (distance-driven adverse movement) is more reliable
-than exact target timing under this approximation.
+This is crude and "directional only". Stop-side behavior is more reliable than exact
+target timing.
 
 If data/spx_intraday.csv is absent, this module writes a stub report and exits gracefully.
 """
@@ -44,7 +53,6 @@ TIMED_EXIT_ET = "15:15"
 ALT_STOP_DISTANCES = [8, 10, 12, 15]
 
 CONTRACT_MULTIPLIER = 100.0
-# Mark approximation knobs (documented assumptions; directional only)
 MARK_DISTANCE_CUSHION_PTS = 2.0
 INV_MARK_DISTANCE_CUSHION_PTS = 1.0 / MARK_DISTANCE_CUSHION_PTS
 MARK_DISTANCE_SLOPE = 0.11
@@ -97,11 +105,9 @@ def _estimate_mark(credit: float, distance_pts: float, elapsed_min: float, total
     total_min = max(total_min, 1.0)
     elapsed_frac = float(np.clip(elapsed_min / total_min, 0.0, 1.0))
 
-    # Decay benefit is strongest when price is pinned near the body (small distance).
     pin_factor = float(np.clip(1.0 - distance_pts * INV_MARK_DISTANCE_CUSHION_PTS, 0.0, 1.0))
     decay_component = credit * PROFIT_TARGET_FRAC * elapsed_frac * pin_factor
 
-    # Distance expansion captures adverse intrinsic pressure when underlying moves away.
     distance_component = max(distance_pts - MARK_DISTANCE_CUSHION_PTS, 0.0) * MARK_DISTANCE_SLOPE
 
     raw_mark = credit - decay_component + distance_component
@@ -120,7 +126,13 @@ def _simulate_trade_path(
     intraday: pd.DataFrame,
     alt_stop_dist: float | None = None,
 ) -> dict:
-    """Simulate first-firing exit for baseline or alt-stop variant."""
+    """Simulate first-firing exit for baseline or alt-stop variant.
+
+    baseline_real (alt_stop_dist is None): adverse exit = 1.5x-credit stop; plus
+        30% target; plus 15:15 timed exit.
+    alt_stop_N (alt_stop_dist = N): adverse exit = first abs(underlying - body) >= N
+        breach, REPLACING the 1.5x stop; plus 30% target; plus 15:15 timed exit.
+    """
     body = trade["center_strike"]
     open_dt = pd.to_datetime(trade["openDate"])
     close_dt = pd.to_datetime(trade["closeDate"])
@@ -128,7 +140,8 @@ def _simulate_trade_path(
     actual_pnl = float(trade["pnl"])
     outcome = trade.get("outcome", "WIN" if actual_pnl > 0 else "LOSS")
 
-    variant_label = "baseline_real" if alt_stop_dist is None else f"alt_stop_{int(alt_stop_dist)}"
+    is_baseline = alt_stop_dist is None
+    variant_label = "baseline_real" if is_baseline else f"alt_stop_{int(alt_stop_dist)}"
 
     if np.isnan(body):
         return {
@@ -200,8 +213,10 @@ def _simulate_trade_path(
         mark_close = _estimate_mark(credit, dist_close, elapsed_minutes, total_minutes)
         mark_intrabar = _estimate_mark(credit, dist_intrabar, elapsed_minutes, total_minutes)
 
-        # Real stop first: if breached intrabar, treat as fired at this bar close.
-        if mark_intrabar >= stop_mark:
+        # ---- Adverse side FIRST (intrabar high/low). Ties resolved against position. ----
+        # Baseline ONLY: real 1.5x-credit stop. Skipped in variant passes so a tighter
+        # alt stop is never masked by the baseline stop firing first.
+        if is_baseline and mark_intrabar >= stop_mark:
             est_mark = mark_intrabar
             return {
                 "variant": variant_label,
@@ -219,9 +234,9 @@ def _simulate_trade_path(
                 "note": "",
             }
 
-        # Alternative distance stop uses high/low breach; decision at bar close.
+        # Variant ONLY: alternative distance stop REPLACES the 1.5x stop.
         if (
-            alt_stop_dist is not None
+            not is_baseline
             and ((float(row.high) >= body + alt_stop_dist) or (float(row.low) <= body - alt_stop_dist))
         ):
             est_mark = _estimate_mark(credit, float(alt_stop_dist), elapsed_minutes, total_minutes)
@@ -241,7 +256,7 @@ def _simulate_trade_path(
                 "note": "",
             }
 
-        # Profit target approximation evaluated at bar close.
+        # ---- Profit target SECOND (bar close). Subordinate to the adverse side. ----
         if mark_close <= target_mark:
             est_mark = mark_close
             return {
@@ -426,7 +441,9 @@ STATUS: SKIPPED — data/spx_intraday.csv not found.
 
 This module models the REAL bot exits as the baseline (30% target, 1.5x-credit
 stop, -$1,500 hard cap, 15:15 ET timed exit), then compares alternative
-underlying-distance stops against that baseline.
+underlying-distance stops against that baseline. In each alternative variant the
+N-point distance stop REPLACES the 1.5x-credit stop (it does not stack with it),
+so the comparison is "1.5x-stop world" vs "N-point-stop world".
 
 No intraday data file was detected, so path simulation was skipped. All other
 analyses ran normally.
@@ -497,6 +514,22 @@ BASELINE MODELED (REAL BOT RULES)
 - Timed exit: {TIMED_EXIT_ET} ET unconditional close
 - Entry context: 11:00-14:00 ET (not re-simulated), center strike from trade description
 
+VARIANT DESIGN (clean A/B; alt stop REPLACES the 1.5x stop)
+-----------------------------------------------------------
+Baseline = real exits (1.5x-credit stop + 30% target + 15:15 timed exit).
+Each alt_stop_N variant keeps the real 30% target and 15:15 timed exit, but its
+adverse exit is the FIRST bar where abs(underlying - body) >= N. The 1.5x stop is
+NOT evaluated inside a variant pass, so a tighter N-point stop is never masked by
+the baseline stop firing first. Read each delta as "N-point-stop world minus
+1.5x-stop world".
+
+INTRABAR PRIORITY (documented, conservative)
+--------------------------------------------
+A 1-min bar exposes only OHLC, so adverse (high/low) vs favorable (close) ordering
+within a bar is unknown. Resolution: adverse side (stop / alt-stop, via intrabar
+high/low) is checked FIRST; the 30% target (via bar close) is checked SECOND. Ties
+within a bar are resolved AGAINST the position. This is intentionally conservative.
+
 MARK APPROXIMATION (EXPLICITLY CRUDE)
 -------------------------------------
 No intraday option marks are available, so mark is inferred from underlying distance
@@ -510,9 +543,13 @@ Actual recorded total        : ${actual_total_from_data:,.0f}
 Mean absolute error (trade)  : ${baseline_mae:,.1f}
 Correlation (sim vs actual)  : {baseline_corr:.3f}
 
+⚠ If the simulated baseline does not reasonably track the actual recorded total
+  (large MAE / low correlation), treat the alternative-stop deltas below as
+  UNRELIABLE — the mark approximation is not capturing your real fills well enough.
+
 ALTERNATIVE DISTANCE STOPS VS REAL BASELINE
 -------------------------------------------
-(Each variant keeps real target + timed exit, and adds first-breach abs(underlying-body)>=N)
+(Each variant keeps real target + timed exit; alt stop REPLACES the 1.5x stop)
 """
         ).strip()
     )
