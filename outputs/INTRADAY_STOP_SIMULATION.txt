@@ -6,7 +6,9 @@ STATUS: SKIPPED — data/spx_intraday.csv not found.
 
 This module models the REAL bot exits as the baseline (30% target, 1.5x-credit
 stop, -$1,500 hard cap, 15:15 ET timed exit), then compares alternative
-underlying-distance stops against that baseline.
+underlying-distance stops against that baseline. In each alternative variant the
+N-point distance stop REPLACES the 1.5x-credit stop (it does not stack with it),
+so the comparison is "1.5x-stop world" vs "N-point-stop world".
 
 No intraday data file was detected, so path simulation was skipped. All other
 analyses ran normally.
