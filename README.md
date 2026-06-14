@@ -106,7 +106,7 @@ outputs/movement_pressure_summary.png      # movement/distance diagnostic charts
 |--------|---------|
 | `analysis/vanna_analysis.py` | Main entry point; proxy-vanna & exit-diagnostic analysis |
 | `analysis/entry_filters.py` | Tradable entry-time and prior-day range filters (zero look-ahead) |
-| `analysis/intraday_sim.py` | First-breach stop simulation (gated on `data/spx_intraday.csv`) |
+| `analysis/intraday_sim.py` | Real-bot baseline intraday simulation (30% PT / 1.5x SL / -$1,500 cap / 15:15 timed exit) + alternative distance-stop tests (gated on `data/spx_intraday.csv`) |
 
 Running `python analysis/vanna_analysis.py` triggers all three in sequence.
 
@@ -138,10 +138,14 @@ it in production.
 - Weak predictors on a 39-trade sample; forward-test before trusting.
 
 ### INTRADAY_STOP_SIMULATION.txt (tradable, requires intraday data)
-- If `delta > 0`: stop helped on this sample. Validate forward.
-- If `delta < 0`: whipsaw — stop would have hurt. Do NOT automate.
-- P/L approximation at breach is optimistic (intrinsic only, no time value).
-  Actual stopped P/L is slightly worse than shown.
+- Baseline models the real bot exits: 30% profit target, 1.5x-credit stop,
+  -$1,500 hard cap, and unconditional 15:15 ET timed exit.
+- Alternative distance stops [8, 10, 12, 15] are tested against that real
+  baseline (not against a no-stop assumption).
+- If `delta_vs_simulated_baseline > 0`: variant helped on this sample.
+- If `delta_vs_simulated_baseline < 0`: whipsaw warning — variant hurt overall.
+- Intraday option marks are unavailable; mark and P/L are inferred from
+  underlying distance to body strike, so results are directional.
 
 ---
 
@@ -154,4 +158,3 @@ it in production.
 - For true institutional-grade vanna/GEX analysis, collect historical SPX chains
   with: `date, timestamp, expiry, dte, strike, call_put, bid, ask, last, volume,
   open_interest, implied_volatility, delta, gamma, vega, theta`.
-

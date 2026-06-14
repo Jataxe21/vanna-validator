@@ -1,44 +1,33 @@
 #!/usr/bin/env python3
 """
-Intraday first-breach stop simulation — TRADABLE COUNTERFACTUAL.
+Intraday simulation for the live 0DTE SPX short iron butterfly bot.
 
-This module requires data/spx_intraday.csv with columns:
-    timestamp, open, high, low, close
-(1-minute bars; ES futures acceptable as proxy — document the source)
+REAL BOT BASELINE MODELED HERE
+------------------------------
+- Entry context (not re-simulated): body strike is centered at the max-absolute-GEX strike,
+  entry window is 11:00 ET to 14:00 ET, and center_strike extraction from trade description
+  is used as the position center.
+- Profit target: close at 30% profit on credit received
+    -> target close mark ~= 0.70 * entry credit.
+- Stop loss: close when mark >= 1.5x entry credit.
+- Hard loss cap: per-contract P/L floor of -$1,500.
+- Timed exit: unconditional close at 15:15 ET (45 min before 16:00 ET expiry)
+  if target/stop have not already triggered.
 
-If the file is ABSENT the module prints a single informational message,
-writes a stub note into outputs/INTRADAY_STOP_SIMULATION.txt, and returns
-without error. The rest of the analysis is unaffected.
+IMPORTANT APPROXIMATION (NO INTRADAY OPTION MARKS AVAILABLE)
+-------------------------------------------------------------
+Intraday option prices are unavailable in this repository, so the fly mark is inferred from
+underlying distance to the body strike:
 
-If PRESENT, for each trade it simulates an honest first-breach stop:
-    body = center strike (same logic as VannaProxyValidator.center_strike())
-    window = intraday bars where openDate <= timestamp <= closeDate
-    For each candidate stop distance N in [8, 10, 12, 15] points:
-        Find the FIRST bar where abs(midpoint − body) >= N
-          OR high >= body + N  (upper breach)
-          OR low  <= body − N  (lower breach — checked first via low/high).
-        Decision uses ONLY bars at or before the breach timestamp.
-        Estimate fly P/L at breach (see approximation note below).
-    Compute aggregate stopped_pnl for each N and the delta vs baseline.
+    d = abs(underlying - body)
+    mark(d, t) ~= credit - decay_component(d, t) + distance_component(d)
 
-WHY THIS IS TRADABLE:
-    The stop trigger (bar high/low relative to body + N) is knowable at the
-    moment of that bar's close. No exit price or post-breach data is used.
+where decay is strongest when d is small and time has elapsed, and distance_component grows
+when d moves away from the body. This is a crude approximation and is explicitly treated as
+"directional only". Stop-side behavior (distance-driven adverse movement) is more reliable
+than exact target timing under this approximation.
 
-P/L APPROXIMATION AT BREACH:
-    Exact option prices at the breach bar are not available. The approximation:
-        estimated_close_cost_per_share = N   (intrinsic only; no time value)
-        pnl_at_breach = (openPrice − N) * 100
-    This is conservative in the sense that the actual cost to close is
-    usually slightly HIGHER than pure intrinsic (residual time value adds cost).
-    The approximation is therefore OPTIMISTIC for the stop scenario; if anything,
-    the real stopped P/L is somewhat worse than shown. The directional conclusion
-    (stop good vs. bad) is still valid.
-
-    If pnl_at_breach > actual_pnl the stop would have helped.
-    If pnl_at_breach < actual_pnl the stop would have hurt (whipsaw).
-
-CAUTION: 39 trades is a small sample. Results are directional only.
+If data/spx_intraday.csv is absent, this module writes a stub report and exits gracefully.
 """
 
 from pathlib import Path
@@ -48,11 +37,25 @@ import numpy as np
 import pandas as pd
 
 
+PROFIT_TARGET_FRAC = 0.30
+STOP_CREDIT_MULT = 1.5
+HARD_CAP_LOSS_PER_CONTRACT = 1500
+TIMED_EXIT_ET = "15:15"
+ALT_STOP_DISTANCES = [8, 10, 12, 15]
+
+CONTRACT_MULTIPLIER = 100.0
+# Mark approximation knobs (documented assumptions; directional only)
+MARK_DISTANCE_CUSHION_PTS = 2.0
+INV_MARK_DISTANCE_CUSHION_PTS = 1.0 / MARK_DISTANCE_CUSHION_PTS
+MARK_DISTANCE_SLOPE = 0.11
+MARK_MAX_MULTIPLE = 3.0
+
+
 INTRADAY_SCHEMA = dedent("""
     Expected schema for data/spx_intraday.csv
     ------------------------------------------
     Column      Type        Description
-    timestamp   datetime    Bar timestamp (e.g., 2026-05-04 10:55:00)
+    timestamp   datetime    Bar timestamp (e.g., 2026-05-04 11:00:00)
                             Must be parseable by pd.to_datetime().
                             Timezone: assumed ET (same as trades).
     open        float       Bar open price
@@ -67,12 +70,6 @@ INTRADAY_SCHEMA = dedent("""
                (from earliest openDate to latest closeDate).
 """)
 
-STOP_DISTANCES = [8, 10, 12, 15]
-
-
-# ---------------------------------------------------------------------------
-# Center-strike extractor (mirrors VannaProxyValidator.center_strike)
-# ---------------------------------------------------------------------------
 
 def _center_strike(description: str) -> float:
     """Extract repeated short/body strike from an iron butterfly description."""
@@ -89,247 +86,368 @@ def _center_strike(description: str) -> float:
     return float(pd.Series(strikes).value_counts().index[0])
 
 
-# ---------------------------------------------------------------------------
-# Per-trade first-breach simulation
-# ---------------------------------------------------------------------------
+def _timed_exit_timestamp(open_dt: pd.Timestamp) -> pd.Timestamp:
+    """Return same-day 15:15 ET timestamp for a trade's open day."""
+    hour, minute = [int(x) for x in TIMED_EXIT_ET.split(":")]
+    return open_dt.normalize() + pd.Timedelta(hours=hour, minutes=minute)
 
-def _simulate_trade(
+
+def _estimate_mark(credit: float, distance_pts: float, elapsed_min: float, total_min: float) -> float:
+    """Approximate iron-fly mark from distance to body and elapsed time."""
+    total_min = max(total_min, 1.0)
+    elapsed_frac = float(np.clip(elapsed_min / total_min, 0.0, 1.0))
+
+    # Decay benefit is strongest when price is pinned near the body (small distance).
+    pin_factor = float(np.clip(1.0 - distance_pts * INV_MARK_DISTANCE_CUSHION_PTS, 0.0, 1.0))
+    decay_component = credit * PROFIT_TARGET_FRAC * elapsed_frac * pin_factor
+
+    # Distance expansion captures adverse intrinsic pressure when underlying moves away.
+    distance_component = max(distance_pts - MARK_DISTANCE_CUSHION_PTS, 0.0) * MARK_DISTANCE_SLOPE
+
+    raw_mark = credit - decay_component + distance_component
+    max_mark = max(credit * MARK_MAX_MULTIPLE, credit + 40.0)
+    return float(np.clip(raw_mark, 0.0, max_mark))
+
+
+def _estimate_pnl(credit: float, est_mark: float) -> float:
+    """Estimate per-contract P/L and apply hard loss cap."""
+    pnl = (credit - est_mark) * CONTRACT_MULTIPLIER
+    return float(max(pnl, -HARD_CAP_LOSS_PER_CONTRACT))
+
+
+def _simulate_trade_path(
     trade: pd.Series,
     intraday: pd.DataFrame,
-    stop_dist: float,
+    alt_stop_dist: float | None = None,
 ) -> dict:
-    """
-    Simulate a first-breach stop for a single trade.
-
-    Returns a dict with breach_found, breach_timestamp, pnl_at_breach,
-    actual_pnl, stopped (bool), pnl_if_stopped.
-    """
+    """Simulate first-firing exit for baseline or alt-stop variant."""
     body = trade["center_strike"]
-    open_date = pd.to_datetime(trade["openDate"])
-    close_date = pd.to_datetime(trade["closeDate"])
-    open_price = float(trade["openPrice"])
+    open_dt = pd.to_datetime(trade["openDate"])
+    close_dt = pd.to_datetime(trade["closeDate"])
+    credit = float(trade["openPrice"])
     actual_pnl = float(trade["pnl"])
+    outcome = trade.get("outcome", "WIN" if actual_pnl > 0 else "LOSS")
+
+    variant_label = "baseline_real" if alt_stop_dist is None else f"alt_stop_{int(alt_stop_dist)}"
 
     if np.isnan(body):
         return {
-            "stop_dist": stop_dist,
-            "breach_found": False,
-            "breach_timestamp": pd.NaT,
-            "pnl_at_breach": np.nan,
+            "variant": variant_label,
+            "stop_distance_pts": alt_stop_dist,
+            "first_exit_reason": "no_data",
+            "exit_timestamp": pd.NaT,
+            "est_mark": np.nan,
+            "est_pnl": actual_pnl,
             "actual_pnl": actual_pnl,
-            "stopped": False,
-            "pnl_if_stopped": actual_pnl,
+            "outcome": outcome,
+            "center_strike": body,
+            "open_price": credit,
+            "trade_openDate": open_dt,
+            "trade_closeDate": close_dt,
             "note": "center_strike extraction failed",
         }
 
-    window = intraday[
-        (intraday["timestamp"] >= open_date) & (intraday["timestamp"] <= close_date)
-    ].copy()
+    if np.isnan(credit) or credit <= 0:
+        return {
+            "variant": variant_label,
+            "stop_distance_pts": alt_stop_dist,
+            "first_exit_reason": "no_data",
+            "exit_timestamp": pd.NaT,
+            "est_mark": np.nan,
+            "est_pnl": actual_pnl,
+            "actual_pnl": actual_pnl,
+            "outcome": outcome,
+            "center_strike": body,
+            "open_price": credit,
+            "trade_openDate": open_dt,
+            "trade_closeDate": close_dt,
+            "note": "invalid openPrice",
+        }
+
+    timed_exit_ts = _timed_exit_timestamp(open_dt)
+    end_ts = min(close_dt, timed_exit_ts)
+    total_minutes = max((timed_exit_ts - open_dt).total_seconds() / 60.0, 1.0)
+
+    window = intraday[(intraday["timestamp"] >= open_dt) & (intraday["timestamp"] <= end_ts)].copy()
 
     if window.empty:
         return {
-            "stop_dist": stop_dist,
-            "breach_found": False,
-            "breach_timestamp": pd.NaT,
-            "pnl_at_breach": np.nan,
+            "variant": variant_label,
+            "stop_distance_pts": alt_stop_dist,
+            "first_exit_reason": "no_data",
+            "exit_timestamp": pd.NaT,
+            "est_mark": np.nan,
+            "est_pnl": actual_pnl,
             "actual_pnl": actual_pnl,
-            "stopped": False,
-            "pnl_if_stopped": actual_pnl,
+            "outcome": outcome,
+            "center_strike": body,
+            "open_price": credit,
+            "trade_openDate": open_dt,
+            "trade_closeDate": close_dt,
             "note": "no intraday bars in trade window",
         }
 
-    # Find first bar where high >= body + N or low <= body - N.
-    breach_mask = (window["high"] >= body + stop_dist) | (window["low"] <= body - stop_dist)
-    breach_bars = window[breach_mask]
+    target_mark = (1.0 - PROFIT_TARGET_FRAC) * credit
+    stop_mark = STOP_CREDIT_MULT * credit
 
-    if breach_bars.empty:
-        return {
-            "stop_dist": stop_dist,
-            "breach_found": False,
-            "breach_timestamp": pd.NaT,
-            "pnl_at_breach": np.nan,
-            "actual_pnl": actual_pnl,
-            "stopped": False,
-            "pnl_if_stopped": actual_pnl,
-            "note": "no breach within trade window",
-        }
+    for row in window.itertuples(index=False):
+        ts = row.timestamp
+        elapsed_minutes = max((ts - open_dt).total_seconds() / 60.0, 0.0)
 
-    breach_bar = breach_bars.iloc[0]
-    breach_ts = breach_bar["timestamp"]
+        dist_close = abs(float(row.close) - body)
+        dist_intrabar = max(abs(float(row.high) - body), abs(float(row.low) - body))
 
-    # Approximate P/L at breach (intrinsic only).
-    # pnl_at_breach = (credit_received − intrinsic_cost) * multiplier
-    # intrinsic_cost_per_share ≈ stop_dist (the short option has N pts intrinsic)
-    # multiplier for SPX options = 100
-    pnl_at_breach = (open_price - stop_dist) * 100
+        mark_close = _estimate_mark(credit, dist_close, elapsed_minutes, total_minutes)
+        mark_intrabar = _estimate_mark(credit, dist_intrabar, elapsed_minutes, total_minutes)
+
+        # Real stop first: if breached intrabar, treat as fired at this bar close.
+        if mark_intrabar >= stop_mark:
+            est_mark = mark_intrabar
+            return {
+                "variant": variant_label,
+                "stop_distance_pts": alt_stop_dist,
+                "first_exit_reason": "stop_1.5x",
+                "exit_timestamp": ts,
+                "est_mark": est_mark,
+                "est_pnl": _estimate_pnl(credit, est_mark),
+                "actual_pnl": actual_pnl,
+                "outcome": outcome,
+                "center_strike": body,
+                "open_price": credit,
+                "trade_openDate": open_dt,
+                "trade_closeDate": close_dt,
+                "note": "",
+            }
+
+        # Alternative distance stop uses high/low breach; decision at bar close.
+        if (
+            alt_stop_dist is not None
+            and ((float(row.high) >= body + alt_stop_dist) or (float(row.low) <= body - alt_stop_dist))
+        ):
+            est_mark = _estimate_mark(credit, float(alt_stop_dist), elapsed_minutes, total_minutes)
+            return {
+                "variant": variant_label,
+                "stop_distance_pts": alt_stop_dist,
+                "first_exit_reason": variant_label,
+                "exit_timestamp": ts,
+                "est_mark": est_mark,
+                "est_pnl": _estimate_pnl(credit, est_mark),
+                "actual_pnl": actual_pnl,
+                "outcome": outcome,
+                "center_strike": body,
+                "open_price": credit,
+                "trade_openDate": open_dt,
+                "trade_closeDate": close_dt,
+                "note": "",
+            }
+
+        # Profit target approximation evaluated at bar close.
+        if mark_close <= target_mark:
+            est_mark = mark_close
+            return {
+                "variant": variant_label,
+                "stop_distance_pts": alt_stop_dist,
+                "first_exit_reason": "target",
+                "exit_timestamp": ts,
+                "est_mark": est_mark,
+                "est_pnl": _estimate_pnl(credit, est_mark),
+                "actual_pnl": actual_pnl,
+                "outcome": outcome,
+                "center_strike": body,
+                "open_price": credit,
+                "trade_openDate": open_dt,
+                "trade_closeDate": close_dt,
+                "note": "",
+            }
+
+    # If nothing fired in-window, force timed exit at final available bar <= 15:15.
+    last_row = window.iloc[-1]
+    elapsed_minutes = max((last_row["timestamp"] - open_dt).total_seconds() / 60.0, 0.0)
+    dist_close = abs(float(last_row["close"]) - body)
+    est_mark = _estimate_mark(credit, dist_close, elapsed_minutes, total_minutes)
 
     return {
-        "stop_dist": stop_dist,
-        "breach_found": True,
-        "breach_timestamp": breach_ts,
-        "pnl_at_breach": pnl_at_breach,
+        "variant": variant_label,
+        "stop_distance_pts": alt_stop_dist,
+        "first_exit_reason": "timed_1515",
+        "exit_timestamp": last_row["timestamp"],
+        "est_mark": est_mark,
+        "est_pnl": _estimate_pnl(credit, est_mark),
         "actual_pnl": actual_pnl,
-        "stopped": True,
-        "pnl_if_stopped": pnl_at_breach,
+        "outcome": outcome,
+        "center_strike": body,
+        "open_price": credit,
+        "trade_openDate": open_dt,
+        "trade_closeDate": close_dt,
         "note": "",
     }
 
-
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
 
 def run_intraday_stop_simulation(
     trades: pd.DataFrame,
     intraday_file: Path,
     output_dir: Path,
 ) -> None:
-    """
-    Run (or gracefully skip) the intraday first-breach stop simulation.
-
-    Parameters
-    ----------
-    trades        : enriched trades DataFrame (must have openDate, closeDate,
-                    openPrice, pnl, outcome, description or center_strike).
-    intraday_file : Path to data/spx_intraday.csv (may not exist).
-    output_dir    : Path to outputs/ directory.
-    """
+    """Run (or gracefully skip) intraday baseline + alt-stop simulation."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if not Path(intraday_file).exists():
-        # Compute actual date range from trades for the stub report.
         try:
             open_dates = pd.to_datetime(trades["openDate"])
-            date_range = (
-                f"{open_dates.min().strftime('%Y-%m-%d')} to "
-                f"{open_dates.max().strftime('%Y-%m-%d')}"
-            )
+            date_range = f"{open_dates.min().strftime('%Y-%m-%d')} to {open_dates.max().strftime('%Y-%m-%d')}"
         except Exception:
             date_range = ""
         _write_stub_report(output_dir, date_range=date_range)
         print(
-            f"[intraday_sim] data/spx_intraday.csv not found — "
-            "first-breach stop simulation skipped. "
+            "[intraday_sim] data/spx_intraday.csv not found — "
+            "intraday stop simulation skipped. "
             "A stub note has been written to outputs/INTRADAY_STOP_SIMULATION.txt"
         )
         return
 
-    # Load and validate intraday data.
     try:
         intraday = pd.read_csv(intraday_file)
         intraday["timestamp"] = pd.to_datetime(intraday["timestamp"])
         for col in ["open", "high", "low", "close"]:
             intraday[col] = pd.to_numeric(intraday[col], errors="coerce")
+        intraday = intraday.dropna(subset=["timestamp", "open", "high", "low", "close"])
         intraday = intraday.sort_values("timestamp").reset_index(drop=True)
     except Exception as exc:
         print(f"[intraday_sim] Failed to load {intraday_file}: {exc}")
         _write_stub_report(output_dir, error=str(exc))
         return
 
-    # Ensure center_strike is available.
     trades = trades.copy()
+    required_cols = {"openDate", "closeDate", "openPrice", "pnl", "description"}
+    if not required_cols.issubset(set(trades.columns)):
+        missing = sorted(required_cols - set(trades.columns))
+        _write_stub_report(output_dir, error=f"Missing required trade columns: {missing}")
+        return
+
+    trades["openDate"] = pd.to_datetime(trades["openDate"])
+    trades["closeDate"] = pd.to_datetime(trades["closeDate"])
+    trades["openPrice"] = pd.to_numeric(trades["openPrice"], errors="coerce")
+    trades["pnl"] = pd.to_numeric(trades["pnl"], errors="coerce")
+
     if "center_strike" not in trades.columns:
         trades["center_strike"] = trades["description"].apply(_center_strike)
-    if "openPrice" not in trades.columns:
-        trades["openPrice"] = pd.to_numeric(trades.get("openPrice"), errors="coerce")
+    if "outcome" not in trades.columns:
+        trades["outcome"] = np.where(trades["pnl"] > 0, "WIN", "LOSS")
 
-    # Run simulation for each trade × stop distance.
-    all_rows = []
+    baseline_rows = []
+    variant_rows = []
+
     for _, trade in trades.iterrows():
-        for dist in STOP_DISTANCES:
-            result = _simulate_trade(trade, intraday, dist)
-            result["trade_openDate"] = trade["openDate"]
-            result["trade_closeDate"] = trade["closeDate"]
-            result["outcome"] = trade["outcome"]
-            result["center_strike"] = trade["center_strike"]
-            all_rows.append(result)
+        baseline_rows.append(_simulate_trade_path(trade, intraday, alt_stop_dist=None))
+        for dist in ALT_STOP_DISTANCES:
+            variant_rows.append(_simulate_trade_path(trade, intraday, alt_stop_dist=float(dist)))
 
-    sim_df = pd.DataFrame(all_rows)
+    baseline_df = pd.DataFrame(baseline_rows)
+    variants_df = pd.DataFrame(variant_rows)
+    trades_detail_df = pd.concat([baseline_df, variants_df], ignore_index=True)
 
-    # Aggregate by stop distance.
-    baseline_pnl = float(trades["pnl"].sum())
-    agg_rows = []
-    for dist in STOP_DISTANCES:
-        sub = sim_df[sim_df["stop_dist"] == dist]
-        stopped_count = int(sub["stopped"].sum())
-        stopped_wins = int(
-            sub[sub["stopped"] & (sub["outcome"] == "WIN")]["stopped"].sum()
-        )
-        stopped_losses = int(
-            sub[sub["stopped"] & (sub["outcome"] == "LOSS")]["stopped"].sum()
-        )
-        total_pnl_if_stopped = float(sub["pnl_if_stopped"].sum())
-        delta = total_pnl_if_stopped - baseline_pnl
-        agg_rows.append({
-            "stop_distance_pts": dist,
-            "trades_stopped": stopped_count,
-            "stops_on_winners": stopped_wins,
-            "stops_on_losers": stopped_losses,
-            "total_pnl_if_stopped": total_pnl_if_stopped,
-            "pnl_delta_vs_baseline": delta,
-            "whipsaw_warning": "YES — stop hurt overall" if delta < 0 else "no",
-        })
+    simulated_baseline_total = float(baseline_df["est_pnl"].sum())
+    actual_total_from_data = float(trades["pnl"].sum())
 
-    agg_df = pd.DataFrame(agg_rows)
-
-    # Write outputs.
-    sim_df.to_csv(output_dir / "intraday_stop_simulation_trades.csv", index=False)
-    agg_df.to_csv(output_dir / "intraday_stop_simulation_summary.csv", index=False)
-    _write_full_report(trades, sim_df, agg_df, baseline_pnl, output_dir)
-
-    print(
-        f"[intraday_sim] First-breach stop simulation complete. "
-        f"Outputs written to {output_dir}"
+    baseline_valid = baseline_df[["est_pnl", "actual_pnl"]].dropna()
+    est_std = baseline_valid["est_pnl"].std()
+    actual_std = baseline_valid["actual_pnl"].std()
+    if (
+        len(baseline_valid) > 1
+        and np.isfinite(est_std)
+        and np.isfinite(actual_std)
+        and est_std > 0
+        and actual_std > 0
+    ):
+        baseline_corr = float(baseline_valid["est_pnl"].corr(baseline_valid["actual_pnl"]))
+    else:
+        baseline_corr = np.nan
+    baseline_mae = (
+        float((baseline_valid["est_pnl"] - baseline_valid["actual_pnl"]).abs().mean())
+        if len(baseline_valid)
+        else np.nan
     )
 
+    summary_rows = []
+    for dist in ALT_STOP_DISTANCES:
+        variant_name = f"alt_stop_{dist}"
+        sub = variants_df[variants_df["variant"] == variant_name]
 
-# ---------------------------------------------------------------------------
-# Report writers
-# ---------------------------------------------------------------------------
+        stopped_mask = sub["first_exit_reason"] == variant_name
+        trades_stopped = int(stopped_mask.sum())
+        stops_on_winners = int((stopped_mask & (sub["actual_pnl"] > 0)).sum())
+        stops_on_losers = int((stopped_mask & (sub["actual_pnl"] <= 0)).sum())
+
+        total_pnl_variant = float(sub["est_pnl"].sum())
+        delta_vs_simulated_baseline = total_pnl_variant - simulated_baseline_total
+        delta_vs_actual_recorded = total_pnl_variant - actual_total_from_data
+
+        summary_rows.append(
+            {
+                "stop_distance_pts": dist,
+                "trades_stopped": trades_stopped,
+                "stops_on_winners": stops_on_winners,
+                "stops_on_losers": stops_on_losers,
+                "total_pnl_variant": total_pnl_variant,
+                "delta_vs_simulated_baseline": delta_vs_simulated_baseline,
+                "delta_vs_actual_recorded": delta_vs_actual_recorded,
+                "whipsaw_warning": "YES — stop hurt overall" if delta_vs_simulated_baseline < 0 else "no",
+            }
+        )
+
+    summary_df = pd.DataFrame(summary_rows)
+
+    trades_detail_df.to_csv(output_dir / "intraday_stop_simulation_trades.csv", index=False)
+    summary_df.to_csv(output_dir / "intraday_stop_simulation_summary.csv", index=False)
+
+    _write_full_report(
+        trades=trades,
+        baseline_df=baseline_df,
+        variants_df=variants_df,
+        detail_df=trades_detail_df,
+        summary_df=summary_df,
+        simulated_baseline_total=simulated_baseline_total,
+        actual_total_from_data=actual_total_from_data,
+        baseline_mae=baseline_mae,
+        baseline_corr=baseline_corr,
+        output_dir=output_dir,
+    )
+
+    print(f"[intraday_sim] Real-rule baseline + alternative-stop simulation complete. Outputs written to {output_dir}")
+
 
 def _write_stub_report(output_dir: Path, error: str = "", date_range: str = "") -> None:
     report = """
-INTRADAY FIRST-BREACH STOP SIMULATION
+INTRADAY REAL-BASELINE STOP SIMULATION
 ======================================
 
 STATUS: SKIPPED — data/spx_intraday.csv not found.
 
-This simulation requires intraday SPX (or ES futures proxy) 1-minute bar data.
-No intraday data file was detected, so the path-simulation has been skipped.
-All other analyses ran normally.
+This module models the REAL bot exits as the baseline (30% target, 1.5x-credit
+stop, -$1,500 hard cap, 15:15 ET timed exit), then compares alternative
+underlying-distance stops against that baseline.
+
+No intraday data file was detected, so path simulation was skipped. All other
+analyses ran normally.
 
 HOW TO ENABLE THIS SIMULATION
 ------------------------------
-1. Obtain 1-minute SPX (or ES futures) OHLC data covering the date range of
-   your trades{date_range_note}.
-   Sources: Tradovate, Interactive Brokers, Alpaca, Polygon.io, etc.
-
-2. Format the data as a CSV with the following columns (no extra columns
-   required; extra columns are ignored):
+1. Obtain 1-minute SPX (or ES futures) OHLC data covering your trade range{date_range_note}.
+2. Format as CSV columns: timestamp, open, high, low, close.
 
 {schema}
 
-3. Save the file as data/spx_intraday.csv in the repository root.
+3. Save as data/spx_intraday.csv in repository root.
+4. Re-run: python analysis/vanna_analysis.py
 
-4. Re-run the analysis:  python analysis/vanna_analysis.py
-
-The intraday simulation will activate automatically and write:
+Outputs generated when intraday file is present:
     outputs/INTRADAY_STOP_SIMULATION.txt
-    outputs/intraday_stop_simulation_trades.csv
     outputs/intraday_stop_simulation_summary.csv
-
-WHY THIS SIMULATION IS THE TRADABLE COUNTERFACTUAL
----------------------------------------------------
-Unlike the exit-distance diagnostic in MOVEMENT_PRESSURE_REPORT.txt (which
-uses exit data and is subject to look-ahead bias), the intraday first-breach
-stop uses ONLY intraday bar data that is available at the moment of the breach
-bar's close. It is a genuinely forward-looking risk management rule and the
-result of running it is the correct number to use for evaluating whether a hard
-stop adds value.
+    outputs/intraday_stop_simulation_trades.csv
 """.format(
         schema=INTRADAY_SCHEMA,
-        date_range_note=f" ({date_range})" if date_range else " (see data/trades.csv for date range)",
+        date_range_note=f" ({date_range})" if date_range else " (see data/trades.csv)",
     )
 
     if error:
@@ -340,94 +458,104 @@ stop adds value.
 
 def _write_full_report(
     trades: pd.DataFrame,
-    sim_df: pd.DataFrame,
-    agg_df: pd.DataFrame,
-    baseline_pnl: float,
+    baseline_df: pd.DataFrame,
+    variants_df: pd.DataFrame,
+    detail_df: pd.DataFrame,
+    summary_df: pd.DataFrame,
+    simulated_baseline_total: float,
+    actual_total_from_data: float,
+    baseline_mae: float,
+    baseline_corr: float,
     output_dir: Path,
 ) -> None:
+    def _format_datetime_col(series: pd.Series) -> pd.Series:
+        if pd.api.types.is_datetime64_any_dtype(series):
+            formatted = series.dt.strftime("%Y-%m-%d %H:%M")
+        else:
+            formatted = pd.to_datetime(series).dt.strftime("%Y-%m-%d %H:%M")
+        return formatted.fillna("—")
+
     total = len(trades)
-    wins = int((trades["outcome"] == "WIN").sum())
-    losses = int((trades["outcome"] == "LOSS").sum())
+    wins = int((trades["pnl"] > 0).sum())
+    losses = int((trades["pnl"] <= 0).sum())
 
     lines = []
-    lines.append("""
-INTRADAY FIRST-BREACH STOP SIMULATION
+    lines.append(
+        dedent(
+            f"""
+INTRADAY REAL-BASELINE STOP SIMULATION
 ======================================
 
-╔══════════════════════════════════════════════════════════════════════════════╗
-║  TRADABLE COUNTERFACTUAL — INTRADAY PATH DATA, ZERO LOOK-AHEAD             ║
-║                                                                              ║
-║  Every stop trigger in this simulation uses only intraday bar data that     ║
-║  is available at or before the breach bar's close. No exit price or         ║
-║  post-breach data is used. This IS a valid forward-looking test.            ║
-║                                                                              ║
-║  CONTRAST with MOVEMENT_PRESSURE_REPORT.txt which uses EXIT data and is     ║
-║  labeled POST-HOC / BIASED.                                                  ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+⚠ SAMPLE-SIZE CAUTION: {total} trades ({losses} losses). Directional only.
+  Treat this as hypothesis generation, not statistical proof.
 
-⚠ SAMPLE SIZE CAUTION: 39 trades (9 losses, 30 wins). Results are directional
-  indicators only — validate on next 50+ forward trades before automating.
+BASELINE MODELED (REAL BOT RULES)
+---------------------------------
+- Profit target: {PROFIT_TARGET_FRAC:.0%} of credit (mark <= {(1-PROFIT_TARGET_FRAC):.2f}x credit)
+- Stop loss: mark >= {STOP_CREDIT_MULT:.1f}x credit
+- Hard cap: per-contract P/L floor at -${HARD_CAP_LOSS_PER_CONTRACT:,.0f}
+- Timed exit: {TIMED_EXIT_ET} ET unconditional close
+- Entry context: 11:00-14:00 ET (not re-simulated), center strike from trade description
 
-⚠ P/L APPROXIMATION: At breach, estimated exit price = N (intrinsic only,
-  no time value). Actual close cost is typically slightly higher due to residual
-  time premium, so actual stopped P/L is SOMEWHAT WORSE than shown below.
-  Conclusions remain directionally valid.
+MARK APPROXIMATION (EXPLICITLY CRUDE)
+-------------------------------------
+No intraday option marks are available, so mark is inferred from underlying distance
+from body strike plus elapsed-time decay near the body.
+Stop-side behavior is more reliable than precise target timing under this approximation.
 
-BASELINE
---------""")
-    lines.append(f"Total trades : {total}")
-    lines.append(f"Wins         : {wins}")
-    lines.append(f"Losses       : {losses}")
-    lines.append(f"Total P/L    : ${baseline_pnl:,.0f}")
+BASELINE RECONCILIATION CREDIBILITY CHECK
+-----------------------------------------
+Simulated baseline total P/L : ${simulated_baseline_total:,.0f}
+Actual recorded total        : ${actual_total_from_data:,.0f}
+Mean absolute error (trade)  : ${baseline_mae:,.1f}
+Correlation (sim vs actual)  : {baseline_corr:.3f}
 
-    lines.append("""
-AGGREGATE RESULTS BY STOP DISTANCE
-------------------------------------
-(pnl_delta > 0 = stop helped; pnl_delta < 0 = stop hurt / whipsaw warning)
-""")
-    lines.append(agg_df.to_string(index=False))
+ALTERNATIVE DISTANCE STOPS VS REAL BASELINE
+-------------------------------------------
+(Each variant keeps real target + timed exit, and adds first-breach abs(underlying-body)>=N)
+"""
+        ).strip()
+    )
 
-    # Whipsaw warning
-    for _, row in agg_df.iterrows():
-        if row["pnl_delta_vs_baseline"] < 0:
+    lines.append(summary_df.to_string(index=False))
+
+    for _, row in summary_df.iterrows():
+        if row["delta_vs_simulated_baseline"] < 0:
             lines.append(
-                f"\n⚠ WHIPSAW WARNING for N={row['stop_distance_pts']} pts: "
-                f"a hard stop at this distance would have reduced total P/L by "
-                f"${abs(row['pnl_delta_vs_baseline']):,.0f}. "
-                "Do NOT automate this stop distance."
+                f"\n⚠ WHIPSAW WARNING N={int(row['stop_distance_pts'])}: "
+                f"delta_vs_simulated_baseline = ${row['delta_vs_simulated_baseline']:,.0f}"
             )
 
-    lines.append("""
-PER-TRADE BREACH DETAIL
------------------------
-(pnl_if_stopped = actual P/L when no breach, or estimated stopped P/L at breach)
-""")
-    per_trade_display = sim_df[[
-        "trade_openDate", "outcome", "stop_dist", "breach_found",
-        "breach_timestamp", "actual_pnl", "pnl_at_breach", "pnl_if_stopped", "note",
-    ]].copy()
-    per_trade_display["trade_openDate"] = pd.to_datetime(
-        per_trade_display["trade_openDate"]
-    ).dt.strftime("%Y-%m-%d %H:%M")
-    per_trade_display["breach_timestamp"] = pd.to_datetime(
-        per_trade_display["breach_timestamp"]
-    ).dt.strftime("%Y-%m-%d %H:%M").fillna("—")
-    lines.append(per_trade_display.to_string(index=False))
+    lines.append(
+        dedent(
+            """
 
-    lines.append(dedent("""
+PER-TRADE X PER-VARIANT DETAIL
+------------------------------
+Columns include first_exit_reason (target / stop_1.5x / timed_1515 / alt_stop_N),
+exit_timestamp, est_pnl, and actual_pnl.
+"""
+        ).rstrip()
+    )
 
-HOW TO INTERPRET
-----------------
-1. If pnl_delta_vs_baseline > 0 for a stop distance N: this stop would have
-   improved total P/L on this sample. Still validate forward before automating.
-2. If pnl_delta_vs_baseline < 0: a hard stop here causes whipsaw (stopped out
-   before expiry, price recovers). Do NOT automate. Size management instead.
-3. Compare stops_on_winners vs stops_on_losers: a good stop should fire mostly
-   on losers. If it fires frequently on winners, the distance is too tight.
+    detail_display = detail_df[
+        [
+            "trade_openDate",
+            "variant",
+            "first_exit_reason",
+            "exit_timestamp",
+            "est_pnl",
+            "actual_pnl",
+            "outcome",
+            "stop_distance_pts",
+            "note",
+        ]
+    ].copy()
+    detail_display["trade_openDate"] = _format_datetime_col(detail_display["trade_openDate"])
+    detail_display["exit_timestamp"] = _format_datetime_col(detail_display["exit_timestamp"])
+    lines.append(detail_display.to_string(index=False))
 
-INTRADAY DATA SCHEMA USED
---------------------------
-"""))
+    lines.append("\nINTRADAY DATA SCHEMA USED\n--------------------------")
     lines.append(INTRADAY_SCHEMA)
 
     report = "\n".join(lines)
